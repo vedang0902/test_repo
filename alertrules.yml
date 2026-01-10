@@ -1,0 +1,12 @@
+groups:
+- name: demo-app-alerts
+  rules:
+  - alert: HighErrorRate
+    expr: app_error_rate == 1
+    for: 15s
+    labels:
+      severity: critical
+      service: demo_app
+    annotations:
+      summary: "High error rate detected in demo_app"
+      description: "The application is continuously throwing errors"

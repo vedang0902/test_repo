@@ -1,0 +1,18 @@
+global:
+  smtp_smarthost: 'smtp.gmail.com:587'
+  smtp_from: 'vedangkane@gmail.com'
+  smtp_auth_username: 'vedangkane@gmail.com'
+  smtp_auth_password: 'YOUR_GMAIL_APP_PASSWORD'
+
+route:
+  receiver: 'email-and-webhook'
+
+receivers:
+- name: 'email-and-webhook'
+  email_configs:
+  - to: 'aryansirsavkarc700@gmail.com'
+    send_resolved: true
+
+  webhook_configs:
+  - url: 'http://host.docker.internal:5678/webhook/incident-alert'
+    send_resolved: true
