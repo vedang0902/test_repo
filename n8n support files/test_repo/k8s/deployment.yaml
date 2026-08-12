@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paymentpipeline
+  namespace: payments
+  labels:
+    app: paymentpipeline
+    version: "2.4.1"
+    team: platform-eng
+  annotations:
+    deployment.kubernetes.io/revision: "14"
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"apps/v1","kind":"Deployment"}
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: paymentpipeline
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: paymentpipeline
+        version: "2.4.1"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: paymentpipeline-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: paymentpipeline
+          image: paymentpipeline:2.4.1
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 5000
+              protocol: TCP
+            - name: metrics
+              containerPort: 8000
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: paymentpipeline-config
+            - secretRef:
+                name: paymentpipeline-secrets
+
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+          volumeMounts:
+            - name: db-data
+              mountPath: /data
+
+      volumes:
+        - name: db-data
+          emptyDir: {}
+
+      terminationGracePeriodSeconds: 30

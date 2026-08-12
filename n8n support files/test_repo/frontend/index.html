@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PaymentPipeline — Ops Dashboard</title>
+  <link rel="stylesheet" href="/static/css/styles.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app-shell">
+
+    <!-- Sidebar -->
+    <nav class="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">
+          <span class="logo-icon">⬡</span>
+          <span class="logo-text">PayPipeline</span>
+        </div>
+        <span class="version-badge">v2.4.1</span>
+      </div>
+
+      <ul class="nav-links">
+        <li class="nav-item active" data-page="dashboard">
+          <span class="nav-icon">◈</span> Dashboard
+        </li>
+        <li class="nav-item" data-page="transactions">
+          <span class="nav-icon">⇄</span> Transactions
+        </li>
+        <li class="nav-item" data-page="fraud">
+          <span class="nav-icon">⚑</span> Fraud Monitor
+        </li>
+        <li class="nav-item" data-page="webhooks">
+          <span class="nav-icon">⟳</span> Webhooks
+        </li>
+        <li class="nav-item" data-page="reconciliation">
+          <span class="nav-icon">≈</span> Reconciliation
+        </li>
+        <li class="nav-item" data-page="accounts">
+          <span class="nav-icon">◉</span> Accounts
+        </li>
+      </ul>
+
+      <div class="sidebar-footer">
+        <div class="status-indicator" id="api-status">
+          <span class="dot dot-green"></span>
+          <span>API Connected</span>
+        </div>
+        <a href="/docs" target="_blank" class="docs-link">API Docs ↗</a>
+      </div>
+    </nav>
+
+    <!-- Main content -->
+    <main class="main-content">
+
+      <!-- Top bar -->
+      <header class="topbar">
+        <div class="topbar-title" id="page-title">Dashboard</div>
+        <div class="topbar-actions">
+          <div class="health-chip" id="health-chip">
+            <span class="dot dot-green"></span>
+            <span id="health-label">Healthy</span>
+          </div>
+          <button class="btn-refresh" id="btn-refresh">↺ Refresh</button>
+        </div>
+      </header>
+
+      <!-- Alert banner (shown when errors detected) -->
+      <div class="alert-banner" id="alert-banner" style="display:none">
+        <span class="alert-icon">⚠</span>
+        <span id="alert-text">Anomalies detected in the pipeline</span>
+        <button onclick="document.getElementById('alert-banner').style.display='none'">✕</button>
+      </div>
+
+      <!-- Dashboard page -->
+      <section class="page active" id="page-dashboard">
+
+        <!-- KPI row -->
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-label">Total Transactions</div>
+            <div class="kpi-value" id="kpi-total">—</div>
+            <div class="kpi-sub">Since startup</div>
+          </div>
+          <div class="kpi-card kpi-green">
+            <div class="kpi-label">Completed</div>
+            <div class="kpi-value" id="kpi-completed">—</div>
+            <div class="kpi-sub" id="kpi-completed-pct">—</div>
+          </div>
+          <div class="kpi-card kpi-red">
+            <div class="kpi-label">Failed / Partial</div>
+            <div class="kpi-value" id="kpi-failed">—</div>
+            <div class="kpi-sub">Partial commits + failures</div>
+          </div>
+          <div class="kpi-card kpi-orange">
+            <div class="kpi-label">Fraud Blocked</div>
+            <div class="kpi-value" id="kpi-fraud">—</div>
+            <div class="kpi-sub">Score ≥ 0.65 threshold</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Volume Processed</div>
+            <div class="kpi-value" id="kpi-volume">—</div>
+            <div class="kpi-sub">USD equivalent</div>
+          </div>
+          <div class="kpi-card kpi-yellow">
+            <div class="kpi-label">Recon Drift</div>
+            <div class="kpi-value" id="kpi-drift">—</div>
+            <div class="kpi-sub">Float arithmetic error</div>
+          </div>
+        </div>
+
+        <!-- Live error feed + DB pool -->
+        <div class="grid-2col">
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">Live Error Feed</span>
+              <span class="badge badge-red" id="error-count-badge">0</span>
+            </div>
+            <div class="error-feed" id="error-feed">
+              <div class="feed-placeholder">Waiting for errors...</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">DB Connection Pool</span>
+              <span class="badge" id="pool-status-badge">checking...</span>
+            </div>
+            <div class="pool-visual" id="pool-visual"></div>
+            <div class="pool-stats" id="pool-stats">
+              <div class="pool-stat"><span>Available</span><span id="pool-avail">—</span></div>
+              <div class="pool-stat"><span>In Use</span><span id="pool-inuse">—</span></div>
+              <div class="pool-stat"><span>Max</span><span id="pool-max">—</span></div>
+              <div class="pool-stat"><span>Total Exhaustions</span><span id="pool-exhausted">—</span></div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Bug status cards -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Active Bug Signals</span>
+            <span class="card-sub">Auto-detected anomalies in the payment pipeline</span>
+          </div>
+          <div class="bug-grid" id="bug-grid">
+            <div class="bug-card" id="bug-partial">
+              <div class="bug-icon">⚡</div>
+              <div class="bug-name">Partial Commits</div>
+              <div class="bug-count" id="bug-partial-count">—</div>
+              <div class="bug-desc">Orphaned debits</div>
+            </div>
+            <div class="bug-card" id="bug-idempotency">
+              <div class="bug-icon">⟳</div>
+              <div class="bug-name">Double Charges</div>
+              <div class="bug-count" id="bug-idem-count">—</div>
+              <div class="bug-desc">Idempotency race</div>
+            </div>
+            <div class="bug-card" id="bug-cascade">
+              <div class="bug-icon">⚑</div>
+              <div class="bug-name">Fraud Cascades</div>
+              <div class="bug-count" id="bug-cascade-count">—</div>
+              <div class="bug-desc">Score compounding</div>
+            </div>
+            <div class="bug-card" id="bug-storm">
+              <div class="bug-icon">↻</div>
+              <div class="bug-name">Webhook Storms</div>
+              <div class="bug-count" id="bug-storm-count">—</div>
+              <div class="bug-desc">Retry loop detected</div>
+            </div>
+            <div class="bug-card" id="bug-deadlock">
+              <div class="bug-icon">⊗</div>
+              <div class="bug-name">Deadlocks</div>
+              <div class="bug-count" id="bug-deadlock-count">—</div>
+              <div class="bug-desc">Lock timeout</div>
+            </div>
+            <div class="bug-card" id="bug-memleak">
+              <div class="bug-icon">▲</div>
+              <div class="bug-name">Cache Size</div>
+              <div class="bug-count" id="bug-cache-count">—</div>
+              <div class="bug-desc">Memory leak</div>
+            </div>
+          </div>
+        </div>
+
+      </section>
+
+      <!-- Transactions page -->
+      <section class="page" id="page-transactions">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Recent Transactions</span>
+            <div class="filter-row">
+              <select id="tx-filter-status" class="select-sm">
+                <option value="">All statuses</option>
+                <option value="completed">Completed</option>
+                <option value="failed">Failed</option>
+                <option value="partial_commit">Partial Commit</option>
+                <option value="fraud_blocked">Fraud Blocked</option>
+              </select>
+            </div>
+          </div>
+          <div class="table-wrapper">
+            <table class="data-table" id="tx-table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>From</th>
+                  <th>To</th>
+                  <th>Amount</th>
+                  <th>Currency</th>
+                  <th>Method</th>
+                  <th>Status</th>
+                  <th>Fraud Score</th>
+                  <th>Fee</th>
+                  <th>Created</th>
+                </tr>
+              </thead>
+              <tbody id="tx-tbody">
+                <tr><td colspan="10" class="table-empty">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- Fraud Monitor page -->
+      <section class="page" id="page-fraud">
+        <div class="grid-2col">
+          <div class="card">
+            <div class="card-header"><span class="card-title">High-Risk Accounts</span></div>
+            <div id="fraud-accounts-list" class="list-panel"></div>
+          </div>
+          <div class="card">
+            <div class="card-header"><span class="card-title">Score Distribution</span></div>
+            <div id="fraud-score-dist" class="score-dist-panel"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Fraud Agent Config</span>
+            <span class="badge">v2.4-rules+ml-hybrid</span>
+          </div>
+          <div class="config-panel" id="fraud-config-panel">
+            <div class="config-row"><span>Block Threshold</span><span class="mono">0.65</span></div>
+            <div class="config-row"><span>Review Threshold</span><span class="mono">0.45</span></div>
+            <div class="config-row"><span>Score Bleed Factor</span><span class="mono badge-red-text">0.30 (bug source)</span></div>
+            <div class="config-row"><span>High Amount Threshold</span><span class="mono">$5,000</span></div>
+            <div class="config-row"><span>Known Issues</span><span class="mono badge-red-text">FRAUD-2247, FRAUD-2301</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Webhooks page -->
+      <section class="page" id="page-webhooks">
+        <div class="kpi-grid kpi-grid-3">
+          <div class="kpi-card">
+            <div class="kpi-label">Total Received</div>
+            <div class="kpi-value" id="wh-total">—</div>
+          </div>
+          <div class="kpi-card kpi-red">
+            <div class="kpi-label">Duplicate Processed</div>
+            <div class="kpi-value" id="wh-dupes">—</div>
+          </div>
+          <div class="kpi-card kpi-orange">
+            <div class="kpi-label">Storm Candidates</div>
+            <div class="kpi-value" id="wh-storms">—</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">Storm Candidates (processed >3×)</span></div>
+          <div id="storm-candidates-list" class="list-panel"></div>
+        </div>
+      </section>
+
+      <!-- Reconciliation page -->
+      <section class="page" id="page-reconciliation">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Reconciliation Report</span>
+            <span class="badge badge-yellow">Float drift active</span>
+          </div>
+          <div id="recon-panel" class="recon-panel">
+            <div class="recon-row"><span>Ledger Balance</span><span class="mono" id="recon-ledger">—</span></div>
+            <div class="recon-row"><span>Actual Balance</span><span class="mono" id="recon-actual">—</span></div>
+            <div class="recon-row recon-drift"><span>Drift (float error)</span><span class="mono" id="recon-drift">—</span></div>
+            <div class="recon-row"><span>Drift %</span><span class="mono" id="recon-drift-pct">—</span></div>
+            <div class="recon-row"><span>Transaction Count</span><span class="mono" id="recon-count">—</span></div>
+            <div class="recon-row"><span>Status</span><span class="mono" id="recon-status">—</span></div>
+          </div>
+          <div class="recon-note">
+            Root cause: <code>fee = amount * fee_rate</code> uses <code>float</code> arithmetic instead of <code>Decimal</code>.
+            Drift accumulates across every transaction and is never reset.
+          </div>
+        </div>
+      </section>
+
+      <!-- Accounts page -->
+      <section class="page" id="page-accounts">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Synthetic Account Pool</span></div>
+          <div class="table-wrapper">
+            <table class="data-table" id="accounts-table">
+              <thead>
+                <tr><th>ID</th><th>Name</th><th>Balance (USD)</th><th>Currency</th><th>Status</th></tr>
+              </thead>
+              <tbody id="accounts-tbody">
+                <tr><td colspan="5" class="table-empty">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+  <script src="/static/js/dashboard.js"></script>
+  <script src="/static/js/payments.js"></script>
+</body>
+</html>

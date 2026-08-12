@@ -1,0 +1,82 @@
+global:
+  smtp_smarthost: 'smtp.gmail.com:587'
+  smtp_from: 'vedangkane@gmail.com'
+  smtp_auth_username: 'vedangkane@gmail.com'
+  smtp_auth_password: 'YOUR_GMAIL_APP_PASSWORD'
+  smtp_require_tls: true
+  resolve_timeout: 5m
+
+# Routing tree
+route:
+  group_by: ['alertname', 'service', 'severity']
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 1h
+  receiver: 'default'
+
+  routes:
+    # Critical alerts → immediate notification
+    - match:
+        severity: critical
+      receiver: 'critical-channel'
+      group_wait: 5s
+      repeat_interval: 15m
+
+    # Bug-specific alerts → n8n webhook for autonomous resolution
+    - match_re:
+        bug: '.+'
+      receiver: 'n8n-autonomous-resolver'
+      group_wait: 5s
+      group_interval: 15s
+      repeat_interval: 30m
+
+    # Warning alerts → email only
+    - match:
+        severity: warning
+      receiver: 'warning-channel'
+      group_wait: 30s
+      repeat_interval: 2h
+
+receivers:
+  - name: 'default'
+    email_configs:
+      - to: 'aryansirsavkarc700@gmail.com'
+        send_resolved: true
+    webhook_configs:
+      - url: 'http://host.docker.internal:5678/webhook/incident-alert'
+        send_resolved: true
+
+  - name: 'critical-channel'
+    email_configs:
+      - to: 'aryansirsavkarc700@gmail.com'
+        send_resolved: true
+        headers:
+          Subject: '[CRITICAL] PaymentPipeline Alert: {{ .GroupLabels.alertname }}'
+    webhook_configs:
+      - url: 'http://host.docker.internal:5678/webhook/incident-alert'
+        send_resolved: true
+        http_config:
+          basic_auth:
+            username: 'alertmanager'
+            password: 'webhook_secret'
+
+  - name: 'n8n-autonomous-resolver'
+    webhook_configs:
+      - url: 'http://host.docker.internal:5678/webhook/incident-alert'
+        send_resolved: true
+        max_alerts: 10
+
+  - name: 'warning-channel'
+    email_configs:
+      - to: 'aryansirsavkarc700@gmail.com'
+        send_resolved: true
+        headers:
+          Subject: '[WARNING] PaymentPipeline: {{ .GroupLabels.alertname }}'
+
+inhibit_rules:
+  # Suppress warning if critical already firing for same service
+  - source_match:
+      severity: critical
+    target_match:
+      severity: warning
+    equal: ['service']

@@ -1,0 +1,197 @@
+{
+    "name": "AI Incident Auto Fix - Datadog",
+    "nodes": [
+      {
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "incident-alert",
+          "responseMode": "onReceived",
+          "options": {}
+        },
+        "id": "webhook",
+        "name": "Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2,
+        "position": [-800, 0],
+        "webhookId": "incident-alert"
+      },
+      {
+        "parameters": {
+          "method": "GET",
+          "url": "https://api.datadoghq.com/api/v1/query",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              { "name": "DD-API-KEY", "value": "={{ $env.DD_API_KEY }}" },
+              { "name": "DD-APPLICATION-KEY", "value": "={{ $env.DD_APP_KEY }}" }
+            ]
+          },
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              { "name": "from", "value": "={{ Math.floor(Date.now() / 1000) - 300 }}" },
+              { "name": "to", "value": "={{ Math.floor(Date.now() / 1000) }}" },
+              { "name": "query", "value": "avg:app.errors{*}" }
+            ]
+          }
+        },
+        "id": "datadog",
+        "name": "Fetch Datadog Metrics",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [-600, 0]
+      },
+      {
+        "parameters": {
+          "jsCode": "const series = $input.item.json.series || [];\nlet error_rate = 0;\nif (series.length > 0 && series[0].pointlist?.length > 0) {\n  const lastPoint = series[0].pointlist.slice(-1)[0];\n  error_rate = lastPoint[1] || 0;\n}\nreturn {\n  json: {\n    metrics: { error_rate_5m: error_rate, source: 'datadog' },\n    raw_alert: $input.item.json\n  }\n};"
+        },
+        "id": "normalize",
+        "name": "Normalize Metrics",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [-400, 0]
+      },
+      {
+        "parameters": {
+          "resource": "file",
+          "operation": "get",
+          "owner": "vedang0902",
+          "repository": "test_repo",
+          "filePath": "app.py"
+        },
+        "id": "github_get",
+        "name": "Get Repo File",
+        "type": "n8n-nodes-base.github",
+        "typeVersion": 1.1,
+        "position": [-400, -220],
+        "credentials": { "githubOAuth2Api": { "id": "YOUR_GITHUB_CREDS", "name": "GitHub" } }
+      },
+      {
+        "parameters": {
+          "jsCode": "const item = $input.item.json;\nlet repo_file_content = '';\nif (typeof item.content === 'string') {\n  try { repo_file_content = Buffer.from(item.content, 'base64').toString('utf8'); } catch (e) { repo_file_content = item.content; }\n} else if (item.data?.content) {\n  try { repo_file_content = Buffer.from(item.data.content, 'base64').toString('utf8'); } catch (e) { repo_file_content = item.data.content; }\n} else { repo_file_content = typeof item === 'string' ? item : JSON.stringify(item); }\nreturn { json: { repo_file_content } };"
+        },
+        "id": "extract",
+        "name": "Extract File",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [-200, -220]
+      },
+      {
+        "parameters": {
+          "mode": "append",
+          "options": {}
+        },
+        "id": "merge",
+        "name": "Merge",
+        "type": "n8n-nodes-base.merge",
+        "typeVersion": 3,
+        "position": [-100, 0]
+      },
+      {
+        "parameters": {
+          "jsCode": "const items = $input.all();\nconst metricsItem = items.find(i => i.json.metrics) || items[0];\nconst repoItem = items.find(i => i.json.repo_file_content !== undefined) || items.find(i => i.json.data !== undefined) || items[1] || items[0];\nconst metrics = metricsItem?.json?.metrics || {};\nconst raw_alert = metricsItem?.json?.raw_alert || {};\nconst repo = repoItem?.json?.repo_file_content ?? repoItem?.json?.data ?? '';\nconst alert = raw_alert.alerts?.[0] || {};\nreturn {\n  json: {\n    incident: {\n      name: alert.labels?.alertname || 'unknown',\n      severity: alert.labels?.severity || 'unknown',\n      summary: alert.annotations?.summary || '',\n      started_at: alert.startsAt || '',\n      status: raw_alert.status || ''\n    },\n    metrics,\n    repo_files: { app_py: typeof repo === 'string' ? repo : JSON.stringify(repo) }\n  }\n};"
+        },
+        "id": "compose",
+        "name": "Compose AI Input",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [100, 0]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [{ "name": "key", "value": "={{ $env.GEMINI_API_KEY }}" }]
+          },
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'You are an SRE. Analyze incident using provided metrics and code. Return valid JSON only with keys: root_cause, fix_summary, patch, risk. Incident: ' + JSON.stringify($json.incident) + ' Metrics: ' + JSON.stringify($json.metrics) + ' Code: ' + ($json.repo_files?.app_py || '') }] }] }) }}"
+        },
+        "id": "ai",
+        "name": "AI Incident Analysis",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [300, 0]
+      },
+      {
+        "parameters": {
+          "jsCode": "const raw = $input.item.json;\nlet ai;\ntry {\n  const text = raw?.candidates?.[0]?.content?.parts?.[0]?.text || raw?.text || '';\n  const cleaned = text.replace(/```json\\n?|```/g, '').trim();\n  ai = JSON.parse(cleaned);\n} catch (e) {\n  ai = { root_cause: 'Invalid AI output', fix_summary: 'Manual review', patch: '', risk: 'high' };\n}\nreturn { json: ai };"
+        },
+        "id": "parse",
+        "name": "Parse AI Output",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [500, 0]
+      },
+      {
+        "parameters": {
+          "jsCode": "const ai = $input.item.json;\nif (!ai.patch || ai.risk === 'high') throw new Error('Unsafe patch or high risk');\nreturn { json: { ...ai, branch: 'ai-fix-' + Date.now() } };"
+        },
+        "id": "validate",
+        "name": "Patch Validator",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [700, 0]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://api.github.com/repos/vedang0902/test_repo/git/refs",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ ref: 'refs/heads/' + $json.branch, sha: 'main' }) }}"
+        },
+        "id": "branch",
+        "name": "Create Branch",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [900, 0],
+        "credentials": { "githubOAuth2Api": { "id": "YOUR_GITHUB_CREDS", "name": "GitHub" } }
+      }
+    ],
+    "connections": {
+      "Webhook": {
+        "main": [[
+          { "node": "Fetch Datadog Metrics", "type": "main", "index": 0 },
+          { "node": "Get Repo File", "type": "main", "index": 0 }
+        ]]
+      },
+      "Fetch Datadog Metrics": {
+        "main": [[{ "node": "Normalize Metrics", "type": "main", "index": 0 }]]
+      },
+      "Normalize Metrics": {
+        "main": [[{ "node": "Merge", "type": "main", "index": 0 }]]
+      },
+      "Get Repo File": {
+        "main": [[{ "node": "Extract File", "type": "main", "index": 0 }]]
+      },
+      "Extract File": {
+        "main": [[{ "node": "Merge", "type": "main", "index": 1 }]]
+      },
+      "Merge": {
+        "main": [[{ "node": "Compose AI Input", "type": "main", "index": 0 }]]
+      },
+      "Compose AI Input": {
+        "main": [[{ "node": "AI Incident Analysis", "type": "main", "index": 0 }]]
+      },
+      "AI Incident Analysis": {
+        "main": [[{ "node": "Parse AI Output", "type": "main", "index": 0 }]]
+      },
+      "Parse AI Output": {
+        "main": [[{ "node": "Patch Validator", "type": "main", "index": 0 }]]
+      },
+      "Patch Validator": {
+        "main": [[{ "node": "Create Branch", "type": "main", "index": 0 }]]
+      }
+    },
+    "active": false,
+    "settings": { "executionOrder": "v1" },
+    "meta": { "templateCredsSetupCompleted": false }
+  }
+    

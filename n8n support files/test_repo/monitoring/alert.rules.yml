@@ -1,0 +1,231 @@
+groups:
+
+  # ── Payment Pipeline Core ──────────────────────────────────────────────────
+  - name: payment-pipeline-core
+    rules:
+
+      - alert: HighErrorRate
+        expr: app_error_rate == 1
+        for: 15s
+        labels:
+          severity: critical
+          service: paymentpipeline
+          team: platform-eng
+        annotations:
+          summary: "PaymentPipeline in error state"
+          description: "app_error_rate=1 — one or more critical bug paths active (partial commit, cascade, deadlock)"
+          runbook: "https://wiki.internal/runbooks/paymentpipeline/high-error-rate"
+
+      - alert: HighTransactionFailureRate
+        expr: |
+          rate(payment_transactions_total{status="failed"}[2m]) /
+          rate(payment_transactions_total[2m]) > 0.10
+        for: 1m
+        labels:
+          severity: warning
+          service: paymentpipeline
+        annotations:
+          summary: "Transaction failure rate exceeds 10%"
+          description: "More than 10% of transactions failing over last 2 minutes"
+
+  # ── Database / Connection Pool ─────────────────────────────────────────────
+  - name: database-alerts
+    rules:
+
+      - alert: DBPoolExhausted
+        expr: db_pool_connections_available == 0
+        for: 10s
+        labels:
+          severity: critical
+          service: paymentpipeline
+        annotations:
+          summary: "Database connection pool exhausted"
+          description: "All {{ $value }} connections in use. New payments will fail immediately."
+
+      - alert: DBPoolLow
+        expr: db_pool_connections_available < 2
+        for: 30s
+        labels:
+          severity: warning
+          service: paymentpipeline
+        annotations:
+          summary: "Database connection pool running low"
+          description: "Only {{ $value }} connection(s) available in pool"
+
+      - alert: DBConnectionErrors
+        expr: rate(db_connection_errors_total[2m]) > 0.5
+        for: 30s
+        labels:
+          severity: warning
+          service: paymentpipeline
+        annotations:
+          summary: "Elevated database connection error rate"
+          description: "DB connection errors at {{ $value | humanize }}/s"
+
+      - alert: DBSlowQueries
+        expr: rate(db_slow_queries_total[5m]) > 2
+        for: 1m
+        labels:
+          severity: warning
+          service: paymentpipeline
+        annotations:
+          summary: "Slow database queries detected"
+          description: "{{ $value | humanize }} slow queries/s over last 5 minutes"
+
+  # ── Partial Commit / Orphaned Debits ───────────────────────────────────────
+  - name: partial-commit-alerts
+    rules:
+
+      - alert: PartialCommitDetected
+        expr: increase(payment_partial_commits_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+          service: paymentpipeline
+          bug: "partial_commit"
+        annotations:
+          summary: "Partial transaction commit detected — orphaned debits created"
+          description: "{{ $value }} partial commits in last 5 min. Accounts debited without order confirmation."
+          runbook: "https://wiki.internal/runbooks/paymentpipeline/partial-commit"
+
+      - alert: OrphanedDebitsAccumulating
+        expr: payment_orphaned_debits_total > 5
+        for: 0s
+        labels:
+          severity: critical
+          service: paymentpipeline
+        annotations:
+          summary: "Orphaned debits accumulating"
+          description: "{{ $value }} total orphaned debits. Manual reconciliation required."
+
+  # ── Idempotency / Double Charge ────────────────────────────────────────────
+  - name: idempotency-alerts
+    rules:
+
+      - alert: IdempotencyViolation
+        expr: increase(payment_idempotency_violations_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+          service: paymentpipeline
+          bug: "idempotency_race"
+        annotations:
+          summary: "Double charge detected — idempotency race condition"
+          description: "{{ $value }} idempotency violations in last 5 min. Customers may be double-charged."
+
+  # ── Reconciliation / Float Drift ───────────────────────────────────────────
+  - name: reconciliation-alerts
+    rules:
+
+      - alert: ReconciliationDriftHigh
+        expr: reconciliation_drift_usd > 0.005
+        for: 30s
+        labels:
+          severity: warning
+          service: paymentpipeline
+          bug: "float_drift"
+        annotations:
+          summary: "Reconciliation drift exceeds threshold"
+          description: "Ledger drift is ${{ $value | humanizeDecimal }}. Root cause: float arithmetic in fee calculation."
+
+      - alert: ReconciliationDriftCritical
+        expr: reconciliation_drift_usd > 0.05
+        for: 15s
+        labels:
+          severity: critical
+          service: paymentpipeline
+        annotations:
+          summary: "CRITICAL reconciliation drift — potential financial exposure"
+          description: "Drift of ${{ $value | humanizeDecimal }} detected. Immediate audit required."
+
+  # ── Fraud Detection ────────────────────────────────────────────────────────
+  - name: fraud-alerts
+    rules:
+
+      - alert: FraudCascadeDetected
+        expr: increase(fraud_cascade_events_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: warning
+          service: paymentpipeline
+          bug: "fraud_cascade"
+        annotations:
+          summary: "Fraud score cascade detected"
+          description: "{{ $value }} cascade events in last 5 min. Score compounding may be blocking legitimate transactions."
+
+      - alert: FraudFalsePositiveRate
+        expr: |
+          rate(fraud_false_positives_total[10m]) /
+          rate(fraud_checks_total[10m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          service: paymentpipeline
+        annotations:
+          summary: "Fraud false positive rate elevated"
+          description: "{{ $value | humanizePercentage }} of fraud checks are false positives"
+
+  # ── Webhook Retry Storm ────────────────────────────────────────────────────
+  - name: webhook-alerts
+    rules:
+
+      - alert: WebhookRetryStorm
+        expr: increase(webhook_retry_storm_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: warning
+          service: paymentpipeline
+          bug: "webhook_retry_storm"
+        annotations:
+          summary: "Webhook retry storm detected"
+          description: "{{ $value }} storm events in last 5 min. Same webhooks being processed repeatedly."
+
+      - alert: WebhookDuplicateProcessing
+        expr: rate(webhook_duplicate_processing_total[2m]) > 1
+        for: 1m
+        labels:
+          severity: warning
+          service: paymentpipeline
+        annotations:
+          summary: "High rate of duplicate webhook processing"
+          description: "{{ $value | humanize }} duplicate webhook processes/s"
+
+  # ── Deadlocks ──────────────────────────────────────────────────────────────
+  - name: deadlock-alerts
+    rules:
+
+      - alert: DeadlockDetected
+        expr: increase(payment_deadlock_events_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+          service: paymentpipeline
+          bug: "deadlock"
+        annotations:
+          summary: "Deadlock detected in payment processing"
+          description: "{{ $value }} deadlock events in last 5 min. Lock acquisition timeouts on payment/refund paths."
+
+  # ── Memory Leak ────────────────────────────────────────────────────────────
+  - name: memory-alerts
+    rules:
+
+      - alert: TransactionCacheGrowing
+        expr: payment_transaction_cache_size > 1000
+        for: 0s
+        labels:
+          severity: warning
+          service: paymentpipeline
+          bug: "memory_leak"
+        annotations:
+          summary: "Transaction cache growing unbounded"
+          description: "Cache at {{ $value }} entries. No eviction policy — memory leak in progress."
+
+      - alert: TransactionCacheCritical
+        expr: payment_transaction_cache_size > 5000
+        for: 0s
+        labels:
+          severity: critical
+          service: paymentpipeline
+        annotations:
+          summary: "Transaction cache critical — OOM risk"
+          description: "Cache at {{ $value }} entries. OOM kill imminent without restart."
