@@ -6,13 +6,13 @@
         "path": "incident-alert",
         "options": {}
       },
-      "id": "fd672502-5ba2-43d7-8d67-5dd3910f64d9",
+      "id": "440bca35-8696-44d8-bac4-1cbb82e189dc",
       "name": "Webhook1",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
       "position": [
-        11056,
-        4560
+        13808,
+        5152
       ],
       "webhookId": "incident-alert"
     },
@@ -20,13 +20,13 @@
       "parameters": {
         "jsCode": "// Dynamically select the right source file based on the bug label\nconst alert = $('Webhook1').item.json.body?.alerts?.[0];\nconst bugLabel = alert?.labels?.bug || '';\nconst alertname = alert?.labels?.alertname || '';\n\nconst bugToFile = {\n  'partial_commit':       'app/services/payment_processor.py',\n  'deadlock':             'app/services/payment_processor.py',\n  'idempotency_race':     'app/services/payment_processor.py',\n  'fraud_cascade':        'app/services/fraud_detector.py',\n  'float_drift':          'app/services/reconciliation.py',\n  'webhook_retry_storm':  'app/services/webhook_service.py',\n  'memory_leak':          'app/services/transaction_generator.py',\n};\n\nconst alertToFile = {\n  'DBPoolExhausted':           'app/database.py',\n  'DBPoolLow':                 'app/database.py',\n  'DBConnectionErrors':        'app/database.py',\n  'TransactionCacheGrowing':   'app/services/transaction_generator.py',\n  'TransactionCacheCritical':  'app/services/transaction_generator.py',\n};\n\nconst repoRoot = 'n8n support files/test_repo';\nconst localPath = bugToFile[bugLabel] || alertToFile[alertname] || 'app/services/payment_processor.py';\n\n// URL-encode each path segment (handles spaces in \"n8n support files\")\nconst filePath = (repoRoot + '/' + localPath)\n  .split('/')\n  .map(seg => encodeURIComponent(seg))\n  .join('/');\n\nreturn {\n  json: {\n    owner: 'vedang0902',\n    repository: 'test_repo',\n    path: filePath\n  }\n};"
       },
-      "id": "eb6a1f41-ea2a-44fa-bc6a-56f4b5866890",
+      "id": "df119378-dedc-4230-989d-2f1253b51ac3",
       "name": "Repo Config1",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        11056,
-        4272
+        13808,
+        4864
       ]
     },
     {
@@ -55,13 +55,13 @@
         },
         "options": {}
       },
-      "id": "38c368dc-6254-4055-a9d0-82365656c45c",
+      "id": "76d19257-f2a7-430a-8ce6-c5f2fe629440",
       "name": "Fetch Prometheus Metrics1",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        11264,
-        4656
+        14016,
+        5248
       ]
     },
     {
@@ -71,13 +71,13 @@
         "nodeCredentialType": "githubApi",
         "options": {}
       },
-      "id": "82f5fd83-aad8-4fb9-b933-25fcebb03dd5",
+      "id": "a57bdfc7-f7fb-46ff-982a-5c05420cee38",
       "name": "Get Repo File1",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        11264,
-        4416
+        14016,
+        5008
       ],
       "webhookId": "293ceb1c-687b-41e3-a888-1613ad369a10",
       "credentials": {
@@ -91,50 +91,50 @@
       "parameters": {
         "jsCode": "// Parse Prometheus query_range response format:\n// { status: 'success', data: { resultType: 'matrix', result: [{ metric: {}, values: [[ts, val], ...] }] } }\nconst raw = $input.item.json;\nlet metric_value = 0;\nlet metric_name = 'unknown';\ntry {\n  const result = raw?.data?.result?.[0];\n  if (result) {\n    metric_name = result.metric?.__name__ || Object.values(result.metric || {})[0] || 'unknown';\n    // values is array of [timestamp, value_string] — take the last point\n    const lastPoint = result.values?.slice(-1)?.[0];\n    metric_value = lastPoint ? parseFloat(lastPoint[1]) : 0;\n  }\n} catch (e) {\n  metric_value = 0;\n}\nconst webhookJson = $('Webhook1').item.json;\nconst raw_alert = webhookJson.body || webhookJson;\nconst amAlert = raw_alert.alerts?.[0];\nreturn {\n  json: {\n    metrics: {\n      metric_name,\n      current_value: metric_value,\n      source: 'prometheus',\n      alertname: amAlert?.labels?.alertname || raw_alert.alertname || 'unknown',\n      bug_label: amAlert?.labels?.bug || '',\n      severity: amAlert?.labels?.severity || raw_alert.severity || 'unknown'\n    },\n    raw_alert\n  }\n};"
       },
-      "id": "a14fa779-8c62-44a0-af86-a2f8177b65df",
+      "id": "06de56b7-ea7e-4ca6-8e8b-6eff8e24ac5a",
       "name": "Normalize Metrics1",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        11456,
-        4656
+        14208,
+        5248
       ]
     },
     {
       "parameters": {
         "jsCode": "const item = $input.item.json;\nlet repo_file_content = '';\nif (typeof item.content === 'string') {\n  try { repo_file_content = Buffer.from(item.content, 'base64').toString('utf8'); } catch (e) { repo_file_content = item.content; }\n} else if (item.data?.content) {\n  try { repo_file_content = Buffer.from(item.data.content, 'base64').toString('utf8'); } catch (e) { repo_file_content = item.data.content; }\n} else { repo_file_content = typeof item === 'string' ? item : JSON.stringify(item); }\n// Capture the file's blob sha too - required later to commit an update to\n// this same file via the GitHub Contents API.\nconst repo_file_sha = item.sha || item.data?.sha || '';\nreturn { json: { repo_file_content, repo_file_sha } };"
       },
-      "id": "44c091d0-32a2-4220-9bee-b038935c0d2f",
+      "id": "8008a7b1-9e0b-481c-9dc3-918de4069a90",
       "name": "Extract File1",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        11456,
-        4416
+        14208,
+        5008
       ]
     },
     {
       "parameters": {},
-      "id": "e9fd1198-e9ce-4469-9aba-71e8abc218d7",
+      "id": "93e49a20-ed92-4e3d-bde8-94feaa3d2e79",
       "name": "Merge1",
       "type": "n8n-nodes-base.merge",
       "typeVersion": 3,
       "position": [
-        11664,
-        4544
+        14416,
+        5136
       ]
     },
     {
       "parameters": {
-        "jsCode": "const items = $input.all();\nconst metricsItem = items.find(i => i.json.metrics) || items[0];\nconst repoItem = items.find(i => i.json.repo_file_content !== undefined) || items[1] || items[0];\nconst metrics = metricsItem?.json?.metrics || {};\nconst raw_alert = metricsItem?.json?.raw_alert || {};\nconst repo = repoItem?.json?.repo_file_content ?? '';\nconst repo_file_sha = repoItem?.json?.repo_file_sha || '';\n\nconst amAlert = raw_alert.alerts?.[0];\nconst incident = amAlert ? {\n  name: amAlert.labels?.alertname || 'unknown',\n  severity: amAlert.labels?.severity || 'unknown',\n  summary: amAlert.annotations?.summary || '',\n  started_at: amAlert.startsAt || '',\n  status: raw_alert.status || ''\n} : {\n  name: raw_alert.alertname || raw_alert.title || raw_alert.name || 'unknown',\n  severity: raw_alert.severity || raw_alert.priority || 'unknown',\n  summary: raw_alert.summary || raw_alert.text || raw_alert.body || '',\n  started_at: raw_alert.date || raw_alert.started_at || '',\n  status: raw_alert.status || raw_alert.alert_type || ''\n};\n\n// Reconstruct github info from the alert rather than cross-branch reference\nconst bugLabel = amAlert?.labels?.bug || '';\nconst alertname = amAlert?.labels?.alertname || '';\nconst bugToFile = {\n  'partial_commit':       'app/services/payment_processor.py',\n  'deadlock':             'app/services/payment_processor.py',\n  'idempotency_race':     'app/services/payment_processor.py',\n  'fraud_cascade':        'app/services/fraud_detector.py',\n  'float_drift':          'app/services/reconciliation.py',\n  'webhook_retry_storm':  'app/services/webhook_service.py',\n  'memory_leak':          'app/services/transaction_generator.py',\n};\nconst alertToFile = {\n  'DBPoolExhausted':          'app/database.py',\n  'DBPoolLow':                'app/database.py',\n  'TransactionCacheGrowing':  'app/services/transaction_generator.py',\n};\nconst repoRoot = 'n8n support files/test_repo';\nconst localPath = bugToFile[bugLabel] || alertToFile[alertname] || 'app/services/payment_processor.py';\nconst filePath = (repoRoot + '/' + localPath).split('/').map(seg => encodeURIComponent(seg)).join('/');\n\nreturn {\n  json: {\n    incident,\n    metrics,\n    repo_files: { app_py: typeof repo === 'string' ? repo : JSON.stringify(repo) },\n    repo_file_sha,\n    github: { owner: 'vedang0902', repository: 'test_repo', path: filePath }\n  }\n};"
+        "jsCode": "const items = $input.all();\nconst metricsItem = items.find(i => i.json.metrics) || items[0];\nconst repoItem = items.find(i => i.json.repo_file_content !== undefined) || items[1] || items[0];\nconst metrics = metricsItem?.json?.metrics || {};\nconst raw_alert = metricsItem?.json?.raw_alert || {};\nconst repo = repoItem?.json?.repo_file_content ?? '';\nconst repo_file_sha = repoItem?.json?.repo_file_sha || '';\n\nconst amAlert = raw_alert.alerts?.[0];\nconst incident = amAlert ? {\n  name: amAlert.labels?.alertname || 'unknown',\n  severity: amAlert.labels?.severity || 'unknown',\n  summary: amAlert.annotations?.summary || '',\n  started_at: amAlert.startsAt || '',\n  status: raw_alert.status || ''\n} : {\n  name: raw_alert.alertname || raw_alert.title || raw_alert.name || 'unknown',\n  severity: raw_alert.severity || raw_alert.priority || 'unknown',\n  summary: raw_alert.summary || raw_alert.text || raw_alert.body || '',\n  started_at: raw_alert.date || raw_alert.started_at || '',\n  status: raw_alert.status || raw_alert.alert_type || ''\n};\n\nconst bugLabel = amAlert?.labels?.bug || '';\nconst alertname = amAlert?.labels?.alertname || '';\nconst bugToFile = {\n  'partial_commit':       'app/services/payment_processor.py',\n  'deadlock':             'app/services/payment_processor.py',\n  'idempotency_race':     'app/services/payment_processor.py',\n  'fraud_cascade':        'app/services/fraud_detector.py',\n  'float_drift':          'app/services/reconciliation.py',\n  'webhook_retry_storm':  'app/services/webhook_service.py',\n  'memory_leak':          'app/services/transaction_generator.py',\n};\nconst alertToFile = {\n  'DBPoolExhausted':          'app/database.py',\n  'DBPoolLow':                'app/database.py',\n  'TransactionCacheGrowing':  'app/services/transaction_generator.py',\n};\nconst repoRoot = 'n8n support files/test_repo';\nconst localPath = bugToFile[bugLabel] || alertToFile[alertname] || 'app/services/payment_processor.py';\nconst filePath = (repoRoot + '/' + localPath).split('/').map(seg => encodeURIComponent(seg)).join('/');\n\nconst fileContent = typeof repo === 'string' ? repo : JSON.stringify(repo);\nconst promptText = `You are an SRE. Analyze the incident using the provided metrics and code, then propose a fix.\n\nReturn valid JSON only with these exact keys:\n- root_cause: string describing the root cause\n- fix_summary: string (1-2 sentences suitable for a PR description)\n- patched_code: string (the FULL corrected content of the file, not a diff)\n- risk: one of: low, medium, high\n\nIncident: ${JSON.stringify(incident)}\nMetrics: ${JSON.stringify(metrics)}\nCurrent file (${localPath}):\n${fileContent}`;\n\nreturn {\n  json: {\n    incident,\n    metrics,\n    repo_file_sha,\n    github: { owner: 'vedang0902', repository: 'test_repo', path: filePath, local_path: localPath },\n    ai_request: {\n      model: 'claude-sonnet-4-6',\n      max_tokens: 8192,\n      messages: [\n        { role: 'user', content: promptText }\n      ]\n    }\n  }\n};"
       },
-      "id": "03d23c87-1425-4d0e-ac3f-a5e708833a4e",
+      "id": "73ed990d-99fb-47ae-8238-71bc5aaa9961",
       "name": "Compose AI Input1",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        11856,
-        4544
+        14608,
+        5136
       ]
     },
     {
@@ -158,16 +158,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "=={{ JSON.stringify({\n  model: 'claude-sonnet-4-6',\n  max_tokens: 8192,\n  messages: [\n    {\n      role: 'user',\n      content: 'You are an SRE. Analyze the incident using the provided metrics and code, then propose a fix. Return valid JSON only with keys: root_cause (string), fix_summary (string, 1-2 sentences suitable for a PR description), patched_code (string, the FULL corrected content of the file - not a diff), risk (one of: low, medium, high). Incident: ' + JSON.stringify($json.incident) + ' Metrics: ' + JSON.stringify($json.metrics) + ' Current file (' + ($json.github?.path || 'app.py') + '): ' + ($json.repo_files?.app_py || '')\n    },\n    { role: 'assistant', content: '{' }\n  ]\n}) }}",
+        "jsonBody": "={{ JSON.stringify($json.ai_request) }}",
         "options": {}
       },
-      "id": "30250641-dd2e-4d4f-97d7-dc76a5dc0214",
+      "id": "84c7107f-bf68-4fb9-b3a0-ffaa95171c69",
       "name": "AI Incident Analysis1",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        12064,
-        4544
+        14816,
+        5136
       ],
       "credentials": {
         "httpQueryAuth": {
@@ -184,26 +184,26 @@
       "parameters": {
         "jsCode": "const raw = $input.item.json;\nlet ai;\ntry {\n  const text = raw?.candidates?.[0]?.content?.parts?.[0]?.text || raw?.text || '';\n  const cleaned = text.replace(/```json\\n?|```/g, '').trim();\n  ai = JSON.parse(cleaned);\n} catch (e) {\n  ai = { root_cause: 'Invalid AI output', fix_summary: 'Manual review needed', patched_code: '', risk: 'high' };\n}\n// The HTTP node above overwrote json with the Gemini response, so pull the\n// incident/github/file context back from Compose AI Input instead of trying\n// to carry it through the API call.\nconst context = $('Compose AI Input1').item.json;\nreturn {\n  json: {\n    ai,\n    incident: context.incident,\n    github: context.github,\n    repo_file_sha: context.repo_file_sha\n  }\n};"
       },
-      "id": "b85008d2-fbf1-4317-bf2f-d9709bbca7a6",
+      "id": "43dc89ce-8442-4cd9-9989-7b45124c3f73",
       "name": "Parse AI Output1",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        12256,
-        4544
+        15008,
+        5136
       ]
     },
     {
       "parameters": {
         "jsCode": "const { ai, incident, github, repo_file_sha } = $input.item.json;\nconst safeRisk = ['low', 'medium'].includes(ai.risk);\nconst hasPatch = typeof ai.patched_code === 'string' && ai.patched_code.trim().length > 0;\nconst ok = safeRisk && hasPatch;\nreturn {\n  json: {\n    ok,\n    reason: ok ? '' : (!hasPatch ? 'AI did not return a patch' : 'Risk level too high: ' + ai.risk),\n    ai,\n    incident,\n    github,\n    repo_file_sha,\n    branch: 'ai-fix-' + Date.now()\n  }\n};"
       },
-      "id": "efbaf5c6-89c6-43d3-b6d1-c0fa96893d17",
+      "id": "57a2eaa1-a9af-4975-83ea-5c726e667c26",
       "name": "Patch Validator1",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        12464,
-        4544
+        15216,
+        5136
       ]
     },
     {
@@ -231,13 +231,13 @@
         },
         "options": {}
       },
-      "id": "b9843392-0452-482f-938f-18f66fc96b43",
+      "id": "5ae2b2fe-2b72-4525-97b2-7b91e3a81302",
       "name": "Is Patch Safe?1",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        12672,
-        4544
+        15424,
+        5136
       ]
     },
     {
@@ -249,13 +249,13 @@
         "text": "=The AI could not produce a safe automatic fix for this incident and it needs manual review.\n\nIncident: {{ $json.incident.name }} (severity: {{ $json.incident.severity }})\nReason: {{ $json.reason }}\nRoot cause (AI): {{ $json.ai.root_cause }}\nRisk (AI): {{ $json.ai.risk }}\n\nPlease investigate manually.",
         "options": {}
       },
-      "id": "263c4884-bf4a-41ce-a468-eac5e9571491",
+      "id": "26765252-d23d-492d-8021-76fe80891ed0",
       "name": "Notify Manual Review Email2",
       "type": "n8n-nodes-base.emailSend",
       "typeVersion": 2.1,
       "position": [
-        12928,
-        4704
+        15680,
+        5296
       ],
       "webhookId": "90e7bd69-a349-4cd4-bdd6-4e4fa3854d14",
       "credentials": {
@@ -274,13 +274,13 @@
         "text": "=An incident was detected and an AI-generated fix has been opened for review.\n\nIncident: {{ $('Patch Validator').item.json.incident.name }} (severity: {{ $('Patch Validator').item.json.incident.severity }})\nRoot cause: {{ $('Patch Validator').item.json.ai.root_cause }}\nFix summary: {{ $('Patch Validator').item.json.ai.fix_summary }}\nRisk: {{ $('Patch Validator').item.json.ai.risk }}\nBranch: {{ $('Patch Validator').item.json.branch }}\nPull request: {{ $json.html_url }}\n\nPlease review and merge manually.",
         "options": {}
       },
-      "id": "426d7f61-bfad-4300-96c0-6bf7328593f1",
+      "id": "5be15eaf-92ed-4c86-b095-fb0dd42f4e2e",
       "name": "Notify Success Email2",
       "type": "n8n-nodes-base.emailSend",
       "typeVersion": 2.1,
       "position": [
-        13728,
-        4416
+        16480,
+        5008
       ],
       "webhookId": "c7726de1-3ad1-4240-b5c9-e0a5b37df2c7",
       "credentials": {
@@ -310,13 +310,13 @@
         "jsonBody": "={{ JSON.stringify({ title: 'AI incident fix: ' + $('Patch Validator').item.json.incident.name, head: $('Patch Validator').item.json.branch, base: 'main', body: 'Root cause: ' + $('Patch Validator').item.json.ai.root_cause + '\\n\\nFix summary: ' + $('Patch Validator').item.json.ai.fix_summary + '\\n\\nRisk: ' + $('Patch Validator').item.json.ai.risk + '\\n\\n_Automatically generated by the incident-repair workflow._' }) }}",
         "options": {}
       },
-      "id": "898dff94-aa1b-43de-ac47-f6621414c5a5",
+      "id": "be6eecbc-39e1-4b97-bc86-581a5e04e147",
       "name": "Create Pull Request2",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        13536,
-        4416
+        16288,
+        5008
       ],
       "credentials": {
         "githubApi": {
@@ -345,13 +345,13 @@
         "jsonBody": "={{ JSON.stringify({ message: 'AI fix: ' + $('Patch Validator').item.json.ai.fix_summary, content: Buffer.from($('Patch Validator').item.json.ai.patched_code).toString('base64'), sha: $('Patch Validator').item.json.repo_file_sha, branch: $('Patch Validator').item.json.branch }) }}",
         "options": {}
       },
-      "id": "d893c1c3-e6b6-46f2-b5ab-3b1636ea7d2b",
+      "id": "ee72e136-9cfb-4756-bbb4-9f46b8c32f21",
       "name": "Commit Patched File2",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        13328,
-        4416
+        16080,
+        5008
       ],
       "credentials": {
         "githubApi": {
@@ -380,13 +380,13 @@
         "jsonBody": "={{ JSON.stringify({ ref: 'refs/heads/' + $('Patch Validator').item.json.branch, sha: $json.object.sha }) }}",
         "options": {}
       },
-      "id": "a1429306-f46d-4546-b070-304d94867576",
+      "id": "3a59eee2-c11c-476b-9539-cf934b70294c",
       "name": "Create Branch2",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        13136,
-        4416
+        15888,
+        5008
       ],
       "credentials": {
         "githubApi": {
@@ -411,13 +411,13 @@
         },
         "options": {}
       },
-      "id": "fb1e360b-a793-4bf6-91c1-bcbf1e928674",
+      "id": "76200896-5451-4739-84ec-bcc7f00acc2f",
       "name": "Get Main Branch SHA2",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        12928,
-        4416
+        15680,
+        5008
       ],
       "credentials": {
         "githubApi": {
