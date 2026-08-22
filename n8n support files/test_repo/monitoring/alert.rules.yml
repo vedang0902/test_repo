@@ -126,7 +126,7 @@ groups:
           bug: "float_drift"
         annotations:
           summary: "Reconciliation drift exceeds threshold"
-          description: "Ledger drift is ${{ $value | humanizeDecimal }}. Root cause: float arithmetic in fee calculation."
+          description: "Ledger drift is ${{ $value | humanize }}. Root cause: float arithmetic in fee calculation."
 
       - alert: ReconciliationDriftCritical
         expr: reconciliation_drift_usd > 0.05
@@ -136,7 +136,7 @@ groups:
           service: paymentpipeline
         annotations:
           summary: "CRITICAL reconciliation drift — potential financial exposure"
-          description: "Drift of ${{ $value | humanizeDecimal }} detected. Immediate audit required."
+          description: "Drift of ${{ $value | humanize }} detected. Immediate audit required."
 
   # ── Fraud Detection ────────────────────────────────────────────────────────
   - name: fraud-alerts

@@ -15,20 +15,22 @@ route:
   receiver: 'default'
 
   routes:
-    # Critical alerts → immediate notification
-    - match:
-        severity: critical
-      receiver: 'critical-channel'
-      group_wait: 5s
-      repeat_interval: 15m
-
-    # Bug-specific alerts → n8n webhook for autonomous resolution
+    # Bug-specific alerts → n8n webhook for autonomous resolution (checked FIRST)
+    # continue: true so they also flow into the severity-based routes below
     - match_re:
         bug: '.+'
       receiver: 'n8n-autonomous-resolver'
       group_wait: 5s
       group_interval: 15s
       repeat_interval: 30m
+      continue: true
+
+    # Critical alerts → immediate notification + n8n webhook
+    - match:
+        severity: critical
+      receiver: 'critical-channel'
+      group_wait: 5s
+      repeat_interval: 15m
 
     # Warning alerts → email only
     - match:
@@ -74,9 +76,12 @@ receivers:
           Subject: '[WARNING] PaymentPipeline: {{ .GroupLabels.alertname }}'
 
 inhibit_rules:
-  # Suppress warning if critical already firing for same service
+  # Suppress non-bug warnings if a critical is already firing for the same service.
+  # Bug-labeled alerts are excluded so they always reach n8n regardless of other alerts.
   - source_match:
       severity: critical
     target_match:
       severity: warning
+    target_match_re:
+      bug: '^$'    # Only suppress warnings that have NO bug label
     equal: ['service']
