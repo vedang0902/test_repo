@@ -26,7 +26,7 @@ Fix (NOT applied): Use asyncio.Lock per key, or a DB unique constraint with
   INSERT OR IGNORE and read-back.
 
 =============================================================================
-BUG 2: Partial Transaction Commit (Orphaned Debit)
+BUG 2: Partial Transaction Commit (Orphaned Debit) — FIXED
 =============================================================================
 Root cause:
   Payment processing is a two-phase write:
@@ -37,18 +37,23 @@ Root cause:
   (simulates: network partition, PG write timeout, OOM kill of DB slave).
   The account is debited but no confirmed order exists — an orphaned debit.
 
-Fix (NOT applied): Wrap both phases in a DB transaction with ACID guarantees.
-  Use saga pattern with compensating transaction (credit back) on failure.
+Fix (APPLIED):
+  Both phases are now executed inside a single DB transaction (no intermediate
+  conn.commit()). If phase 2 fails the entire transaction is rolled back via
+  conn.rollback(), keeping the account balance intact. As an additional
+  safety net a compensating credit is attempted (saga pattern) in the rare
+  case the rollback itself cannot fully undo the write.
 
 =============================================================================
-BUG 3: Deadlock on Lock Ordering
+BUG 3: Deadlock on Lock Ordering — FIXED
 =============================================================================
-Two processing paths acquire locks in opposite order:
+Two processing paths previously acquired locks in opposite order:
   process_payment: acquire account_lock → acquire order_lock
   process_refund:  acquire order_lock  → acquire account_lock
 
-Under concurrent load the classic deadlock scenario plays out.
-We detect it via asyncio.wait_for timeout and log/metric it.
+Fix (APPLIED): process_refund now acquires locks in the same order as
+  process_payment (acct_lock first, then order_lock), eliminating the
+  classic hold-and-wait deadlock scenario.
 
 Symptoms in logs:
   CRITICAL payment_processor | DOUBLE CHARGE: idempotency_key=idem_xxx processed twice
@@ -82,9 +87,7 @@ cfg = settings.payment
 # Never expires (another memory leak contributing to transaction_cache_size)
 _idempotency_store: Dict[str, Transaction] = {}
 
-# ── Deadlock-prone locks ──────────────────────────────────────────────────────
-# BUG: payment acquires _acct_lock then _order_lock
-#      refund acquires _order_lock then _acct_lock  → classic deadlock
+# ── Locks — both paths now acquire in the same order: acct → order ───────────
 _acct_lock = asyncio.Lock()
 _order_lock = asyncio.Lock()
 
@@ -110,7 +113,9 @@ class PaymentProcessor:
     async def process_payment(self, tx: Transaction) -> Transaction:
         """
         Full payment processing pipeline.
-        Contains BUG 1 (race condition) and BUG 2 (partial commit).
+        BUG 2 (partial commit) is fixed — both DB phases run inside a single
+        atomic transaction.  BUG 1 (idempotency race) remains unfixed here
+        per original scope; see module docstring for the recommended fix.
         """
         start = time.monotonic()
         m.active_payment_requests.inc()
@@ -169,11 +174,10 @@ class PaymentProcessor:
                 m.idempotency_cache_size.set(len(_idempotency_store))
                 return tx
 
-            # ── Step 3: Acquire lock (BUG: order of lock acquisition differs
-            #    from refund path → deadlock under concurrent load) ──────────
+            # ── Step 3: Acquire locks (consistent order: acct → order) ────────
             try:
                 lock_start = time.monotonic()
-                acquired = await asyncio.wait_for(_acct_lock.acquire(), timeout=3.0)
+                await asyncio.wait_for(_acct_lock.acquire(), timeout=3.0)
                 m.lock_wait_duration_seconds.labels(lock_type="account_lock").observe(
                     time.monotonic() - lock_start
                 )
@@ -210,65 +214,85 @@ class PaymentProcessor:
                     f"Deadlock: timeout acquiring order lock for tx {tx.id}"
                 )
 
-            # ── Step 4: Two-phase DB write (BUG: partial commit) ─────────────
+            # ── Step 4: Atomic two-phase DB write (BUG 2 FIXED) ──────────────
+            # Both the account debit (phase 1) and the order/transaction insert
+            # (phase 2) are executed inside a SINGLE database transaction.
+            # conn.commit() is called only ONCE after both writes succeed.
+            # On any failure conn.rollback() undoes the debit, preventing
+            # orphaned debits.  A compensating credit is attempted as a saga
+            # fallback in case rollback is insufficient (e.g. already-committed
+            # partial write on a non-transactional storage path).
             conn = None
             try:
                 conn = db_pool.acquire()
 
-                # ── Phase 1: Debit account ────────────────────────────────────
+                # Begin explicit transaction (autocommit must be off, which is
+                # the default for most DB-API 2.0 drivers; call begin() if your
+                # driver requires it explicitly).
+                try:
+                    conn.begin()
+                except AttributeError:
+                    # Driver starts a transaction implicitly on first execute().
+                    pass
+
+                # ── Phase 1: Debit account (NOT committed yet) ────────────────
                 conn.execute(
                     "UPDATE accounts SET balance = balance - ? WHERE id = ? AND is_active = 1",
                     (tx.amount, tx.from_account),
                 )
-                conn.commit()
-                logger.debug(f"[Payment] Phase 1 complete: debited ${tx.amount:.2f} from {tx.from_account}")
+                logger.debug(
+                    f"[Payment] Phase 1 staged: debit ${tx.amount:.2f} "
+                    f"from {tx.from_account} (not yet committed)"
+                )
 
-                # BUG: Intermittent failure between phase 1 and phase 2.
-                # Simulates: network timeout writing to replica, OOM on DB host,
-                # application crash (SIGKILL), etc.
+                # Simulate intermittent phase-2 failure (the condition that
+                # previously caused orphaned debits).  With the fix in place the
+                # transaction is rolled back, so no debit persists.
                 if random.random() < settings.payment.partial_commit_rate:
-                    # Account debited, order NOT created → orphaned debit
-                    tx.mark_partial_commit(
-                        f"Phase 2 write failed after debit of ${tx.amount:.2f} "
-                        f"(intermittent DB error)"
+                    # Roll back the staged debit — account balance is preserved.
+                    conn.rollback()
+                    tx.mark_failed(
+                        f"Phase 2 write failed after staging debit of "
+                        f"${tx.amount:.2f} (intermittent DB error) — "
+                        f"debit rolled back, no orphaned debit created."
                     )
-                    m.partial_commits_total.inc()
-                    m.orphaned_debits_total.inc()
                     m.payment_transactions_total.labels(
-                        status="partial_commit",
+                        status="failed_rolled_back",
                         method=tx.method.value,
                         currency=tx.currency,
                     ).inc()
                     m.app_errors_total.labels(
                         component="payment_processor",
-                        error_type="partial_commit",
+                        error_type="phase2_failure_rolled_back",
                     ).inc()
-                    m.app_error_rate.set(1)
-                    logger.critical(
-                        f"[Payment] PARTIAL COMMIT: tx={tx.id} account={tx.from_account} "
-                        f"debited ${tx.amount:.2f} but order confirmation FAILED. "
-                        f"ORPHANED DEBIT created."
+                    logger.error(
+                        f"[Payment] Phase 2 failure for tx={tx.id}: debit "
+                        f"rolled back cleanly. No orphaned debit."
                     )
-                    # Record to idempotency so we don't retry
                     _idempotency_store[tx.idempotency_key] = tx
                     m.idempotency_cache_size.set(len(_idempotency_store))
                     return tx
 
-                # ── Phase 2: Confirm order ────────────────────────────────────
+                # ── Phase 2: Confirm order (same transaction) ─────────────────
                 order_id = str(uuid.uuid4())
                 merchant_id = f"merchant_{random.randint(100, 999)}"
 
                 conn.execute(
-                    """INSERT INTO orders (id, transaction_id, merchant_id, total_amount, status, created_at)
+                    """INSERT INTO orders
+                           (id, transaction_id, merchant_id, total_amount, status, created_at)
                        VALUES (?, ?, ?, ?, 'confirmed', ?)""",
-                    (order_id, tx.id, merchant_id, tx.amount, datetime.utcnow().isoformat()),
+                    (
+                        order_id, tx.id, merchant_id,
+                        tx.amount, datetime.utcnow().isoformat(),
+                    ),
                 )
 
-                # Insert transaction record
+                # Insert transaction record (same transaction)
                 conn.execute(
                     """INSERT INTO transactions
-                       (id, idempotency_key, from_account, to_account, amount, currency,
-                        method, status, fraud_score, fee, net_amount, metadata, created_at, updated_at)
+                           (id, idempotency_key, from_account, to_account, amount, currency,
+                            method, status, fraud_score, fee, net_amount, metadata,
+                            created_at, updated_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         tx.id, tx.idempotency_key, tx.from_account, tx.to_account,
@@ -279,7 +303,13 @@ class PaymentProcessor:
                         tx.created_at.isoformat(), datetime.utcnow().isoformat(),
                     ),
                 )
+
+                # ── Single commit covering both phases ────────────────────────
                 conn.commit()
+                logger.debug(
+                    f"[Payment] Atomic commit succeeded: debit + order "
+                    f"for tx={tx.id} committed together."
+                )
 
                 tx.mark_completed()
                 reconciliation_service.record_transaction(tx)
@@ -299,6 +329,23 @@ class PaymentProcessor:
                 )
 
             except (DBConnectionError, PoolExhaustedError) as e:
+                # Attempt rollback to undo any staged writes.
+                if conn:
+                    try:
+                        conn.rollback()
+                        logger.warning(
+                            f"[Payment] DB error for tx={tx.id} — "
+                            f"transaction rolled back: {e}"
+                        )
+                    except Exception as rb_err:
+                        # Rollback failed — attempt saga compensating credit.
+                        logger.critical(
+                            f"[Payment] ROLLBACK FAILED for tx={tx.id}: {rb_err}. "
+                            f"Attempting compensating credit of ${tx.amount:.2f} "
+                            f"to account {tx.from_account}."
+                        )
+                        await self._compensate_debit(tx)
+
                 tx.mark_failed(str(e))
                 m.payment_transactions_total.labels(
                     status="failed_db",
@@ -308,9 +355,24 @@ class PaymentProcessor:
                 m.app_errors_total.labels(
                     component="payment_processor", error_type="db_error"
                 ).inc()
-                logger.error(
-                    f"[Payment] DB error for tx={tx.id}: {e}"
-                )
+                logger.error(f"[Payment] DB error for tx={tx.id}: {e}")
+                raise
+
+            except Exception as e:
+                # Unexpected error after phase 1 executed — roll back.
+                if conn:
+                    try:
+                        conn.rollback()
+                        logger.warning(
+                            f"[Payment] Unexpected error for tx={tx.id} — "
+                            f"transaction rolled back: {e}"
+                        )
+                    except Exception as rb_err:
+                        logger.critical(
+                            f"[Payment] ROLLBACK FAILED for tx={tx.id}: {rb_err}. "
+                            f"Attempting compensating credit."
+                        )
+                        await self._compensate_debit(tx)
                 raise
 
             finally:
@@ -364,13 +426,53 @@ class PaymentProcessor:
             ).observe(elapsed)
             m.active_payment_requests.dec()
 
-    async def process_refund(self, original_tx: Transaction, reason: str, amount: TypingOptional[float] = None) -> Transaction:
+    async def _compensate_debit(self, tx: Transaction) -> None:
+        """
+        Saga compensating transaction: credit back the debited amount when
+        rollback is unavailable or failed.  Logs and metrics are emitted
+        regardless of whether the credit itself succeeds so that the
+        reconciliation team has a clear audit trail.
+        """
+        try:
+            comp_conn = db_pool.acquire()
+            try:
+                comp_conn.execute(
+                    "UPDATE accounts SET balance = balance + ? WHERE id = ?",
+                    (tx.amount, tx.from_account),
+                )
+                comp_conn.commit()
+                m.payment_amount_processed_usd.inc(-tx.amount)  # reverse the metric
+                logger.info(
+                    f"[Payment] Compensating credit applied: ${tx.amount:.2f} "
+                    f"returned to {tx.from_account} for failed tx={tx.id}."
+                )
+            finally:
+                db_pool.release(comp_conn)
+        except Exception as comp_err:
+            # Compensation failed — surface for manual intervention.
+            m.orphaned_debits_total.inc()
+            m.app_errors_total.labels(
+                component="payment_processor",
+                error_type="compensation_failed",
+            ).inc()
+            logger.critical(
+                f"[Payment] COMPENSATION FAILED for tx={tx.id}: {comp_err}. "
+                f"MANUAL RECONCILIATION REQUIRED for account={tx.from_account} "
+                f"amount=${tx.amount:.2f}."
+            )
+
+    async def process_refund(
+        self,
+        original_tx: Transaction,
+        reason: str,
+        amount: TypingOptional[float] = None,
+    ) -> Transaction:
         """
         Process a refund for a completed transaction.
 
-        BUG: Acquires locks in OPPOSITE ORDER to process_payment:
-          process_payment: _acct_lock → _order_lock
-          process_refund:  _order_lock → _acct_lock   ← DEADLOCK under concurrency
+        BUG 3 FIXED: Locks are now acquired in the same order as
+        process_payment (acct_lock first, then order_lock), eliminating
+        the hold-and-wait deadlock.
         """
         refund_amount = amount or original_tx.amount
 
@@ -388,54 +490,65 @@ class PaymentProcessor:
         start = time.monotonic()
 
         try:
-            # BUG: Lock order reversed — order_lock first, then acct_lock
+            # FIX: Acquire acct_lock FIRST (same order as process_payment).
             try:
                 lock_start = time.monotonic()
-                await asyncio.wait_for(_order_lock.acquire(), timeout=2.5)
-                m.lock_wait_duration_seconds.labels(lock_type="order_lock").observe(
+                await asyncio.wait_for(_acct_lock.acquire(), timeout=2.5)
+                m.lock_wait_duration_seconds.labels(lock_type="account_lock").observe(
                     time.monotonic() - lock_start
                 )
             except asyncio.TimeoutError:
-                m.deadlock_events_total.labels(lock_type="order_lock").inc()
-                m.app_errors_total.labels(
-                    component="payment_processor", error_type="deadlock"
-                ).inc()
-                logger.error(
-                    f"[Refund] DEADLOCK: timeout acquiring order_lock "
-                    f"refund_tx={refund_tx.id} original_tx={original_tx.id}"
-                )
-                raise PaymentProcessorError("Deadlock: timeout acquiring order lock for refund")
-
-            try:
-                acct_start = time.monotonic()
-                await asyncio.wait_for(_acct_lock.acquire(), timeout=2.5)
-                m.lock_wait_duration_seconds.labels(lock_type="account_lock").observe(
-                    time.monotonic() - acct_start
-                )
-            except asyncio.TimeoutError:
-                _order_lock.release()
                 m.deadlock_events_total.labels(lock_type="account_lock").inc()
                 m.app_errors_total.labels(
                     component="payment_processor", error_type="deadlock"
                 ).inc()
                 logger.error(
-                    f"[Refund] DEADLOCK: timeout acquiring account_lock "
-                    f"while order_lock held. original_tx={original_tx.id}"
+                    f"[Refund] Timeout acquiring account_lock for "
+                    f"refund_tx={refund_tx.id} original_tx={original_tx.id}"
                 )
-                raise PaymentProcessorError("Deadlock: timeout acquiring account lock during refund")
+                raise PaymentProcessorError(
+                    "Timeout acquiring account lock for refund"
+                )
+
+            # FIX: Acquire order_lock SECOND (same order as process_payment).
+            try:
+                order_start = time.monotonic()
+                await asyncio.wait_for(_order_lock.acquire(), timeout=2.5)
+                m.lock_wait_duration_seconds.labels(lock_type="order_lock").observe(
+                    time.monotonic() - order_start
+                )
+            except asyncio.TimeoutError:
+                _acct_lock.release()
+                m.deadlock_events_total.labels(lock_type="order_lock").inc()
+                m.app_errors_total.labels(
+                    component="payment_processor", error_type="deadlock"
+                ).inc()
+                logger.error(
+                    f"[Refund] Timeout acquiring order_lock for "
+                    f"refund_tx={refund_tx.id} original_tx={original_tx.id}"
+                )
+                raise PaymentProcessorError(
+                    "Timeout acquiring order lock for refund"
+                )
 
             # Process refund credit
             try:
                 conn = db_pool.acquire()
                 try:
+                    try:
+                        conn.begin()
+                    except AttributeError:
+                        pass
+
                     conn.execute(
                         "UPDATE accounts SET balance = balance + ? WHERE id = ?",
                         (refund_amount, refund_tx.to_account),
                     )
                     conn.execute(
                         """INSERT INTO transactions
-                           (id, idempotency_key, from_account, to_account, amount, currency,
-                            method, status, fraud_score, fee, net_amount, metadata, created_at, updated_at)
+                               (id, idempotency_key, from_account, to_account, amount,
+                                currency, method, status, fraud_score, fee, net_amount,
+                                metadata, created_at, updated_at)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, ?, ?, ?, ?)""",
                         (
                             refund_tx.id, refund_tx.idempotency_key,
@@ -462,6 +575,14 @@ class PaymentProcessor:
                         f"original={original_tx.id} amount=${refund_amount:.2f}"
                     )
 
+                except Exception as e:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    refund_tx.mark_failed(str(e))
+                    raise
+
                 finally:
                     db_pool.release(conn)
 
@@ -470,14 +591,14 @@ class PaymentProcessor:
                 raise
 
             finally:
-                if _order_lock.locked():
-                    try:
-                        _order_lock.release()
-                    except RuntimeError:
-                        pass
                 if _acct_lock.locked():
                     try:
                         _acct_lock.release()
+                    except RuntimeError:
+                        pass
+                if _order_lock.locked():
+                    try:
+                        _order_lock.release()
                     except RuntimeError:
                         pass
 
