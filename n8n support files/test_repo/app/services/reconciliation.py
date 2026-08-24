@@ -1,41 +1,14 @@
-"""
-Payment Reconciliation Service.
+"""Payment Reconciliation Service.
 
 Runs periodically to verify that the sum of all processed transactions
 matches the expected ledger balance.
-
-=============================================================================
-BUG: Float Arithmetic Currency Drift
-=============================================================================
-Root cause:
-  Transaction amounts, fees, and net amounts are stored as Python `float`
-  (IEEE 754 double-precision). The correct approach for financial systems is
-  `decimal.Decimal` with explicit rounding modes.
-
-  Examples of the drift:
-    0.1 + 0.2  → 0.30000000000000004   (not 0.30)
-    29.99 * 0.029 → 0.86971            (should be 0.87 rounded to 2dp)
-
-  Over hundreds of transactions, the ledger accumulates a systematic drift
-  of several cents. This crosses the $0.005 threshold, triggering alerts.
-
-Fix (NOT applied here):
-  Use `from decimal import Decimal, ROUND_HALF_UP` throughout.
-
-Symptoms in logs:
-  ERROR reconciliation | Drift exceeded threshold: ledger=1023.741200 actual=1023.750000 drift=$0.008800
-  ERROR reconciliation | Reconciliation FAILED: cumulative drift=$0.0312 over 847 transactions
-
-Prometheus metrics:
-  reconciliation_drift_usd              ↑ over time
-  reconciliation_mismatches_total       ↑
-  reconciliation_drift_exceeded_total   ↑
 """
 import logging
 import asyncio
 import time
 from datetime import datetime
-from typing import List, Tuple
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from typing import List
 
 from app.config import settings
 from app.models import Transaction, TransactionStatus, ReconciliationReport
@@ -44,64 +17,88 @@ from app.metrics import prometheus_metrics as m
 logger = logging.getLogger("reconciliation")
 
 cfg = settings.reconciliation
-fee_rate = settings.payment.fee_rate
+# Convert fee_rate once at module load so every call uses an exact Decimal.
+_FEE_RATE: Decimal = Decimal(str(settings.payment.fee_rate))
+_TWO_PLACES = Decimal("0.01")
+
+
+def _to_decimal(value) -> Decimal:
+    """Safely coerce a float or string to Decimal."""
+    try:
+        return Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ValueError(f"Cannot convert {value!r} to Decimal: {exc}") from exc
 
 
 class ReconciliationService:
     """
     Validates that sum(transaction.net_amount) == expected_ledger_balance.
 
-    The ledger is an in-memory running total (float) that accumulates
-    rounding errors over time — a genuine production-grade floating-point bug.
+    All monetary values are stored as decimal.Decimal, rounded to 2 dp with
+    ROUND_HALF_UP at every intermediate step, eliminating IEEE 754 drift.
     """
 
     def __init__(self):
-        # BUG: Both balances are float — should be Decimal
-        self._ledger_balance: float = 0.0       # Running float sum (drifts)
-        self._actual_balance: float = 0.0       # Rounded to 2dp each transaction
-        self._fee_ledger: float = 0.0
-        self._fee_actual: float = 0.0
+        self._ledger_balance: Decimal = Decimal("0.00")
+        self._actual_balance: Decimal = Decimal("0.00")
+        self._fee_ledger: Decimal = Decimal("0.00")
+        self._fee_actual: Decimal = Decimal("0.00")
         self._transaction_count: int = 0
-        self._total_drift: float = 0.0
+        self._total_drift: Decimal = Decimal("0.00")
         self._last_run: datetime = datetime.utcnow()
         self._report_history: List[ReconciliationReport] = []
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _round2(value: Decimal) -> Decimal:
+        """Round to 2 decimal places using ROUND_HALF_UP."""
+        return value.quantize(_TWO_PLACES, rounding=ROUND_HALF_UP)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def record_transaction(self, tx: Transaction):
         """
         Called after every successful transaction to update running balances.
 
-        BUG: fee = amount * fee_rate  →  floating-point multiplication error
-             net = amount - fee       →  accumulates rounding errors per tx
+        All arithmetic is performed in Decimal so there is no floating-point
+        accumulation error.
         """
-        # BUG: Using float multiplication for financial amounts
-        fee = tx.amount * fee_rate                   # e.g. 100.05 * 0.029 = 2.9014499...
-        net = tx.amount - fee                        # Subtraction of two floats
+        amount: Decimal = self._round2(_to_decimal(tx.amount))
 
-        # Ledger accumulates raw floats — drift grows
+        # Round fee and net to 2 dp individually — matches what a customer
+        # sees on their statement and what the ledger should hold.
+        fee: Decimal = self._round2(amount * _FEE_RATE)
+        net: Decimal = self._round2(amount - fee)
+
+        # Both accumulators use the same Decimal arithmetic — no divergence.
         self._ledger_balance += net
         self._fee_ledger += fee
-
-        # Actual uses round() — gets the "right" answer 2dp
-        net_rounded = round(tx.amount - round(tx.amount * fee_rate, 2), 2)
-        fee_rounded = round(tx.amount * fee_rate, 2)
-        self._actual_balance += net_rounded
-        self._fee_actual += fee_rounded
+        self._actual_balance += net
+        self._fee_actual += fee
 
         self._transaction_count += 1
 
-        # Update tx model with float values (preserves bug)
-        tx.fee = fee
-        tx.net_amount = net
+        # Persist exact Decimal values back to the transaction model.
+        # Convert to float only at the boundary if the model requires it.
+        tx.fee = float(fee)
+        tx.net_amount = float(net)
 
-        # Compute drift and emit metrics
-        drift = abs(self._ledger_balance - self._actual_balance)
+        # Drift is always zero with correct Decimal arithmetic; compute
+        # defensively so the metric path stays intact.
+        drift: Decimal = abs(self._ledger_balance - self._actual_balance)
         self._total_drift = drift
 
-        m.ledger_balance_usd.set(self._ledger_balance)
-        m.actual_balance_usd.set(self._actual_balance)
-        m.reconciliation_drift_usd.set(drift)
+        drift_float = float(drift)
+        m.ledger_balance_usd.set(float(self._ledger_balance))
+        m.actual_balance_usd.set(float(self._actual_balance))
+        m.reconciliation_drift_usd.set(drift_float)
 
-        if drift > cfg.drift_threshold:
+        if drift_float > cfg.drift_threshold:
             m.reconciliation_mismatches_total.inc()
             logger.error(
                 f"[Reconciliation] Mismatch detected: "
@@ -113,18 +110,15 @@ class ReconciliationService:
             ).inc()
 
     def run_reconciliation(self) -> ReconciliationReport:
-        """
-        Periodic reconciliation check.
-        Emits alerts if drift exceeds threshold.
-        """
+        """Periodic reconciliation check. Emits alerts if drift exceeds threshold."""
         start = time.monotonic()
-        drift = abs(self._ledger_balance - self._actual_balance)
+        drift: Decimal = abs(self._ledger_balance - self._actual_balance)
+        drift_float = float(drift)
         now = datetime.utcnow()
 
-        # Determine status
-        if drift > cfg.drift_threshold * 10:
+        if drift_float > cfg.drift_threshold * 10:
             status = "critical"
-        elif drift > cfg.drift_threshold:
+        elif drift_float > cfg.drift_threshold:
             status = "mismatch"
         else:
             status = "ok"
@@ -132,9 +126,9 @@ class ReconciliationService:
         report = ReconciliationReport(
             period_start=self._last_run,
             period_end=now,
-            ledger_balance=self._ledger_balance,
-            actual_balance=self._actual_balance,
-            drift=drift,
+            ledger_balance=float(self._ledger_balance),
+            actual_balance=float(self._actual_balance),
+            drift=drift_float,
             transaction_count=self._transaction_count,
             status=status,
             generated_at=now,
@@ -152,7 +146,7 @@ class ReconciliationService:
             ).inc()
             logger.error(
                 f"[Reconciliation] CRITICAL: drift=${drift:.6f} exceeds threshold by "
-                f"{drift / cfg.drift_threshold:.1f}x | "
+                f"{drift_float / cfg.drift_threshold:.1f}x | "
                 f"ledger=${self._ledger_balance:.4f} actual=${self._actual_balance:.4f} | "
                 f"tx_count={self._transaction_count} | elapsed={elapsed_ms:.1f}ms"
             )
@@ -190,18 +184,22 @@ class ReconciliationService:
                 ).inc()
 
     def get_summary(self) -> dict:
-        drift = abs(self._ledger_balance - self._actual_balance)
+        drift: Decimal = abs(self._ledger_balance - self._actual_balance)
+        drift_float = float(drift)
+        actual_float = float(self._actual_balance)
         return {
-            "ledger_balance": self._ledger_balance,
-            "actual_balance": self._actual_balance,
-            "drift": drift,
-            "drift_pct": (drift / max(self._actual_balance, 0.01)) * 100,
+            "ledger_balance": float(self._ledger_balance),
+            "actual_balance": actual_float,
+            "drift": drift_float,
+            "drift_pct": (drift_float / max(actual_float, 0.01)) * 100,
             "transaction_count": self._transaction_count,
-            "total_fees_ledger": self._fee_ledger,
-            "total_fees_actual": self._fee_actual,
-            "status": "critical" if drift > cfg.drift_threshold * 10
-                       else "mismatch" if drift > cfg.drift_threshold
-                       else "ok",
+            "total_fees_ledger": float(self._fee_ledger),
+            "total_fees_actual": float(self._fee_actual),
+            "status": (
+                "critical" if drift_float > cfg.drift_threshold * 10
+                else "mismatch" if drift_float > cfg.drift_threshold
+                else "ok"
+            ),
         }
 
 
