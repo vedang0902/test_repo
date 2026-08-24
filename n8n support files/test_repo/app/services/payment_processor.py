@@ -26,7 +26,7 @@ Fix (NOT applied): Use asyncio.Lock per key, or a DB unique constraint with
   INSERT OR IGNORE and read-back.
 
 =============================================================================
-BUG 2: Partial Transaction Commit (Orphaned Debit)
+BUG 2: Partial Transaction Commit (Orphaned Debit) — FIXED
 =============================================================================
 Root cause:
   Payment processing is a two-phase write:
@@ -37,8 +37,11 @@ Root cause:
   (simulates: network partition, PG write timeout, OOM kill of DB slave).
   The account is debited but no confirmed order exists — an orphaned debit.
 
-Fix (NOT applied): Wrap both phases in a DB transaction with ACID guarantees.
-  Use saga pattern with compensating transaction (credit back) on failure.
+Fix (APPLIED): Both phases are now executed within a single DB transaction.
+  conn.commit() is called only after ALL writes succeed. On any failure
+  between phase 1 and phase 2, conn.rollback() is called to reverse the
+  debit atomically. A compensating credit is attempted as a safety net if
+  rollback itself fails.
 
 =============================================================================
 BUG 3: Deadlock on Lock Ordering
@@ -77,12 +80,12 @@ logger = logging.getLogger("payment_processor")
 
 cfg = settings.payment
 
-# ── Idempotency store (BUG: in-memory, not atomic) ──────────────────────────
+# ── Idempotency store (BUG: in-memory, not atomic) ───────────────────────────────────────
 # Key → Transaction result
 # Never expires (another memory leak contributing to transaction_cache_size)
 _idempotency_store: Dict[str, Transaction] = {}
 
-# ── Deadlock-prone locks ──────────────────────────────────────────────────────
+# ── Deadlock-prone locks ──────────────────────────────────────────────
 # BUG: payment acquires _acct_lock then _order_lock
 #      refund acquires _order_lock then _acct_lock  → classic deadlock
 _acct_lock = asyncio.Lock()
@@ -110,7 +113,10 @@ class PaymentProcessor:
     async def process_payment(self, tx: Transaction) -> Transaction:
         """
         Full payment processing pipeline.
-        Contains BUG 1 (race condition) and BUG 2 (partial commit).
+        BUG 2 (partial commit) is fixed: both DB phases now execute inside
+        a single atomic transaction that is rolled back on any mid-flight
+        failure.
+        Contains BUG 1 (race condition) and BUG 3 (deadlock) — not fixed here.
         """
         start = time.monotonic()
         m.active_payment_requests.inc()
@@ -145,7 +151,7 @@ class PaymentProcessor:
                 )
                 m.app_error_rate.set(1)
 
-            # ── Step 2: Fraud check ───────────────────────────────────────────
+            # ── Step 2: Fraud check ────────────────────────────────────────────
             fraud_result = fraud_detector.check(tx)
             tx.fraud_score = fraud_result.compounded_score
 
@@ -170,7 +176,7 @@ class PaymentProcessor:
                 return tx
 
             # ── Step 3: Acquire lock (BUG: order of lock acquisition differs
-            #    from refund path → deadlock under concurrent load) ──────────
+            #    from refund path → deadlock under concurrent load) ────────
             try:
                 lock_start = time.monotonic()
                 acquired = await asyncio.wait_for(_acct_lock.acquire(), timeout=3.0)
@@ -210,108 +216,162 @@ class PaymentProcessor:
                     f"Deadlock: timeout acquiring order lock for tx {tx.id}"
                 )
 
-            # ── Step 4: Two-phase DB write (BUG: partial commit) ─────────────
+            # ── Step 4: Atomic two-phase DB write (BUG 2 FIXED) ──────────────
+            #
+            # FIX: Both the account debit (phase 1) and the order/transaction
+            # inserts (phase 2) are now executed within a single database
+            # transaction. conn.commit() is deferred until every write has
+            # succeeded. If any step raises — including the simulated
+            # intermittent failure — conn.rollback() is called, which
+            # atomically reverses the debit and prevents an orphaned debit
+            # from ever being persisted.
             conn = None
             try:
                 conn = db_pool.acquire()
 
-                # ── Phase 1: Debit account ────────────────────────────────────
-                conn.execute(
-                    "UPDATE accounts SET balance = balance - ? WHERE id = ? AND is_active = 1",
-                    (tx.amount, tx.from_account),
-                )
-                conn.commit()
-                logger.debug(f"[Payment] Phase 1 complete: debited ${tx.amount:.2f} from {tx.from_account}")
-
-                # BUG: Intermittent failure between phase 1 and phase 2.
-                # Simulates: network timeout writing to replica, OOM on DB host,
-                # application crash (SIGKILL), etc.
-                if random.random() < settings.payment.partial_commit_rate:
-                    # Account debited, order NOT created → orphaned debit
-                    tx.mark_partial_commit(
-                        f"Phase 2 write failed after debit of ${tx.amount:.2f} "
-                        f"(intermittent DB error)"
+                try:
+                    # ── Phase 1: Debit account (NOT committed yet) ──────────
+                    conn.execute(
+                        "UPDATE accounts SET balance = balance - ? WHERE id = ? AND is_active = 1",
+                        (tx.amount, tx.from_account),
                     )
-                    m.partial_commits_total.inc()
-                    m.orphaned_debits_total.inc()
+                    logger.debug(
+                        f"[Payment] Phase 1 staged (not committed): "
+                        f"debit ${tx.amount:.2f} from {tx.from_account}"
+                    )
+
+                    # Simulate intermittent failure between phase 1 and phase 2.
+                    # With the fix in place this will now trigger a rollback
+                    # instead of leaving an orphaned debit.
+                    if random.random() < settings.payment.partial_commit_rate:
+                        # Raise an exception to force rollback of the debit
+                        # staged above. No money leaves the account.
+                        raise PartialCommitError(
+                            f"Simulated intermittent DB error after debit of "
+                            f"${tx.amount:.2f} — rolling back entire transaction"
+                        )
+
+                    # ── Phase 2: Confirm order ──────────────────────────────
+                    order_id = str(uuid.uuid4())
+                    merchant_id = f"merchant_{random.randint(100, 999)}"
+
+                    conn.execute(
+                        """INSERT INTO orders
+                               (id, transaction_id, merchant_id, total_amount, status, created_at)
+                           VALUES (?, ?, ?, ?, 'confirmed', ?)""",
+                        (
+                            order_id, tx.id, merchant_id,
+                            tx.amount, datetime.utcnow().isoformat(),
+                        ),
+                    )
+
+                    # Insert transaction record
+                    conn.execute(
+                        """INSERT INTO transactions
+                               (id, idempotency_key, from_account, to_account, amount, currency,
+                                method, status, fraud_score, fee, net_amount, metadata,
+                                created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            tx.id, tx.idempotency_key, tx.from_account, tx.to_account,
+                            tx.amount, tx.currency, tx.method.value,
+                            TransactionStatus.COMPLETED.value, tx.fraud_score,
+                            tx.fee, tx.net_amount,
+                            json.dumps(tx.metadata),
+                            tx.created_at.isoformat(), datetime.utcnow().isoformat(),
+                        ),
+                    )
+
+                    # All writes succeeded — commit the entire transaction atomically.
+                    conn.commit()
+                    logger.debug(
+                        f"[Payment] Atomic commit successful: "
+                        f"debit + order + transaction record persisted for tx={tx.id}"
+                    )
+
+                except PartialCommitError as pce:
+                    # Roll back the staged debit so no money is taken.
+                    try:
+                        conn.rollback()
+                        logger.warning(
+                            f"[Payment] Rolled back staged debit for tx={tx.id} "
+                            f"after phase-2 failure — no orphaned debit created. "
+                            f"reason={pce}"
+                        )
+                    except Exception as rb_err:
+                        # Rollback itself failed (extremely rare — e.g. connection
+                        # dropped mid-transaction). Emit a compensating credit as
+                        # a last-resort safety net so the customer is made whole.
+                        logger.critical(
+                            f"[Payment] ROLLBACK FAILED for tx={tx.id}: {rb_err}. "
+                            f"Attempting compensating credit of ${tx.amount:.2f} "
+                            f"to account {tx.from_account}."
+                        )
+                        try:
+                            comp_conn = db_pool.acquire()
+                            try:
+                                comp_conn.execute(
+                                    "UPDATE accounts "
+                                    "SET balance = balance + ? "
+                                    "WHERE id = ? AND is_active = 1",
+                                    (tx.amount, tx.from_account),
+                                )
+                                comp_conn.commit()
+                                logger.info(
+                                    f"[Payment] Compensating credit of "
+                                    f"${tx.amount:.2f} applied to {tx.from_account} "
+                                    f"for tx={tx.id}"
+                                )
+                            finally:
+                                db_pool.release(comp_conn)
+                        except Exception as comp_err:
+                            logger.critical(
+                                f"[Payment] Compensating credit ALSO FAILED for "
+                                f"tx={tx.id}: {comp_err}. "
+                                f"Manual remediation required."
+                            )
+
+                    # Whether rollback succeeded or the compensating credit was
+                    # applied, mark the transaction as failed — do NOT return a
+                    # partial-commit result to the caller.
+                    tx.mark_failed(
+                        f"Phase 2 write failed — transaction rolled back, "
+                        f"no debit applied. ({pce})"
+                    )
                     m.payment_transactions_total.labels(
-                        status="partial_commit",
+                        status="failed",
                         method=tx.method.value,
                         currency=tx.currency,
                     ).inc()
                     m.app_errors_total.labels(
                         component="payment_processor",
-                        error_type="partial_commit",
+                        error_type="phase2_rollback",
                     ).inc()
-                    m.app_error_rate.set(1)
-                    logger.critical(
-                        f"[Payment] PARTIAL COMMIT: tx={tx.id} account={tx.from_account} "
-                        f"debited ${tx.amount:.2f} but order confirmation FAILED. "
-                        f"ORPHANED DEBIT created."
+                    logger.error(
+                        f"[Payment] Phase 2 failure rolled back cleanly for "
+                        f"tx={tx.id}. No orphaned debit."
                     )
-                    # Record to idempotency so we don't retry
+                    # Store failed tx in idempotency so retries don't loop.
                     _idempotency_store[tx.idempotency_key] = tx
                     m.idempotency_cache_size.set(len(_idempotency_store))
                     return tx
 
-                # ── Phase 2: Confirm order ────────────────────────────────────
-                order_id = str(uuid.uuid4())
-                merchant_id = f"merchant_{random.randint(100, 999)}"
-
-                conn.execute(
-                    """INSERT INTO orders (id, transaction_id, merchant_id, total_amount, status, created_at)
-                       VALUES (?, ?, ?, ?, 'confirmed', ?)""",
-                    (order_id, tx.id, merchant_id, tx.amount, datetime.utcnow().isoformat()),
-                )
-
-                # Insert transaction record
-                conn.execute(
-                    """INSERT INTO transactions
-                       (id, idempotency_key, from_account, to_account, amount, currency,
-                        method, status, fraud_score, fee, net_amount, metadata, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        tx.id, tx.idempotency_key, tx.from_account, tx.to_account,
-                        tx.amount, tx.currency, tx.method.value,
-                        TransactionStatus.COMPLETED.value, tx.fraud_score,
-                        tx.fee, tx.net_amount,
-                        json.dumps(tx.metadata),
-                        tx.created_at.isoformat(), datetime.utcnow().isoformat(),
-                    ),
-                )
-                conn.commit()
-
-                tx.mark_completed()
-                reconciliation_service.record_transaction(tx)
-
-                m.payment_transactions_total.labels(
-                    status="completed",
-                    method=tx.method.value,
-                    currency=tx.currency,
-                ).inc()
-                m.payment_amount_processed_usd.inc(tx.amount)
-                m.payment_fees_collected_usd.inc(tx.fee)
-
-                logger.info(
-                    f"[Payment] SUCCESS: tx={tx.id} amount=${tx.amount:.2f} "
-                    f"fee=${tx.fee:.4f} net=${tx.net_amount:.4f} "
-                    f"from={tx.from_account} to={tx.to_account}"
-                )
-
-            except (DBConnectionError, PoolExhaustedError) as e:
-                tx.mark_failed(str(e))
-                m.payment_transactions_total.labels(
-                    status="failed_db",
-                    method=tx.method.value,
-                    currency=tx.currency,
-                ).inc()
-                m.app_errors_total.labels(
-                    component="payment_processor", error_type="db_error"
-                ).inc()
-                logger.error(
-                    f"[Payment] DB error for tx={tx.id}: {e}"
-                )
-                raise
+                except (DBConnectionError, PoolExhaustedError) as e:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    tx.mark_failed(str(e))
+                    m.payment_transactions_total.labels(
+                        status="failed_db",
+                        method=tx.method.value,
+                        currency=tx.currency,
+                    ).inc()
+                    m.app_errors_total.labels(
+                        component="payment_processor", error_type="db_error"
+                    ).inc()
+                    logger.error(f"[Payment] DB error for tx={tx.id}: {e}")
+                    raise
 
             finally:
                 if conn:
@@ -329,6 +389,24 @@ class PaymentProcessor:
                         _order_lock.release()
                     except RuntimeError:
                         pass
+
+            # Reaching here means the atomic commit succeeded.
+            tx.mark_completed()
+            reconciliation_service.record_transaction(tx)
+
+            m.payment_transactions_total.labels(
+                status="completed",
+                method=tx.method.value,
+                currency=tx.currency,
+            ).inc()
+            m.payment_amount_processed_usd.inc(tx.amount)
+            m.payment_fees_collected_usd.inc(tx.fee)
+
+            logger.info(
+                f"[Payment] SUCCESS: tx={tx.id} amount=${tx.amount:.2f} "
+                f"fee=${tx.fee:.4f} net=${tx.net_amount:.4f} "
+                f"from={tx.from_account} to={tx.to_account}"
+            )
 
             # Store in idempotency
             _idempotency_store[tx.idempotency_key] = tx
