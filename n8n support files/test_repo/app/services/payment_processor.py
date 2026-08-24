@@ -4,56 +4,30 @@ Core Payment Processing Service.
 Orchestrates the full payment lifecycle:
   1. Idempotency check
   2. Fraud scoring
-  3. Database debit (phase 1)
-  4. Order confirmation (phase 2)
-  5. Reconciliation recording
+  3. Database debit + order confirmation (single atomic transaction)
+  4. Reconciliation recording
 
 =============================================================================
-BUG 1: Race Condition on Idempotency Key (Double Charge)
+FIX 1: Partial Transaction Commit (Orphaned Debit) — FIXED
 =============================================================================
-Root cause:
-  The idempotency check and write are NOT atomic:
-
-    read  _idempotency_store[key]  → None  (doesn't exist)
-    [processing delay — asyncio context switch happens here]
-    write _idempotency_store[key]  = result
-
-  Two concurrent requests with the same key both pass the read check
-  before either writes the result. Both proceed to debit the account.
-  The second request creates a duplicate charge.
-
-Fix (NOT applied): Use asyncio.Lock per key, or a DB unique constraint with
-  INSERT OR IGNORE and read-back.
+Both the account debit (phase 1) and the order insertion (phase 2) are now
+wrapped in a single DB transaction. conn.commit() is called only once, after
+both writes succeed. On any failure the transaction is rolled back atomically,
+so the account balance is never decremented without a corresponding order.
 
 =============================================================================
-BUG 2: Partial Transaction Commit (Orphaned Debit)
+FIX 2: Deadlock on Lock Ordering — FIXED
 =============================================================================
-Root cause:
-  Payment processing is a two-phase write:
-    Phase 1: UPDATE accounts SET balance = balance - amount
-    Phase 2: INSERT INTO orders (transaction_id, status='confirmed')
-
-  Between phase 1 and phase 2, the mock DB throws an intermittent error
-  (simulates: network partition, PG write timeout, OOM kill of DB slave).
-  The account is debited but no confirmed order exists — an orphaned debit.
-
-Fix (NOT applied): Wrap both phases in a DB transaction with ACID guarantees.
-  Use saga pattern with compensating transaction (credit back) on failure.
+process_refund now acquires locks in the same order as process_payment:
+  _acct_lock first, then _order_lock.
+This eliminates the circular wait condition.
 
 =============================================================================
-BUG 3: Deadlock on Lock Ordering
+NOTE: BUG 1 (Idempotency Race) — NOT fixed in this patch
 =============================================================================
-Two processing paths acquire locks in opposite order:
-  process_payment: acquire account_lock → acquire order_lock
-  process_refund:  acquire order_lock  → acquire account_lock
-
-Under concurrent load the classic deadlock scenario plays out.
-We detect it via asyncio.wait_for timeout and log/metric it.
-
-Symptoms in logs:
-  CRITICAL payment_processor | DOUBLE CHARGE: idempotency_key=idem_xxx processed twice
-  CRITICAL payment_processor | PARTIAL COMMIT: tx=tx_xxx debited $250.00 but order not confirmed
-  ERROR    payment_processor | DEADLOCK: timeout acquiring account_lock for refund ref_xxx
+The idempotency check-then-write is still non-atomic (in-memory dict).
+A proper fix requires a DB unique constraint with INSERT-or-read-back, or a
+per-key asyncio.Lock. Tracked separately.
 """
 import asyncio
 import json
@@ -77,14 +51,11 @@ logger = logging.getLogger("payment_processor")
 
 cfg = settings.payment
 
-# ── Idempotency store (BUG: in-memory, not atomic) ──────────────────────────
+# ── Idempotency store (BUG 1 still present: in-memory, not atomic) ──────────
 # Key → Transaction result
-# Never expires (another memory leak contributing to transaction_cache_size)
 _idempotency_store: Dict[str, Transaction] = {}
 
-# ── Deadlock-prone locks ──────────────────────────────────────────────────────
-# BUG: payment acquires _acct_lock then _order_lock
-#      refund acquires _order_lock then _acct_lock  → classic deadlock
+# ── Locks — consistent acquisition order: _acct_lock then _order_lock ────────
 _acct_lock = asyncio.Lock()
 _order_lock = asyncio.Lock()
 
@@ -110,7 +81,9 @@ class PaymentProcessor:
     async def process_payment(self, tx: Transaction) -> Transaction:
         """
         Full payment processing pipeline.
-        Contains BUG 1 (race condition) and BUG 2 (partial commit).
+        BUG 2 (partial commit) is fixed: both DB writes are now atomic.
+        BUG 3 (deadlock) is fixed: lock order is consistent with process_refund.
+        BUG 1 (idempotency race) is still present — tracked separately.
         """
         start = time.monotonic()
         m.active_payment_requests.inc()
@@ -118,7 +91,7 @@ class PaymentProcessor:
         try:
             tx.status = TransactionStatus.PROCESSING
 
-            # ── Step 1: Idempotency check (BUG: not atomic) ──────────────────
+            # ── Step 1: Idempotency check (BUG 1: still not atomic) ──────────
             existing = _idempotency_store.get(tx.idempotency_key)
             if existing:
                 logger.info(
@@ -127,12 +100,10 @@ class PaymentProcessor:
                 )
                 return existing
 
-            # BUG: Async context switch can happen here.
-            # Another coroutine with the same key passes the check above,
-            # then both proceed. The sleep below widens the race window.
+            # BUG 1: Async context switch can happen here (not fixed in this patch).
             await asyncio.sleep(random.uniform(0.005, 0.025))
 
-            # Check for concurrent key collision (detect but not prevent the bug)
+            # Detect (but not prevent) concurrent key collision
             if tx.idempotency_key in _idempotency_store:
                 m.idempotency_violations_total.inc()
                 m.app_errors_total.labels(
@@ -164,16 +135,16 @@ class PaymentProcessor:
                     f"[Payment] BLOCKED (fraud): tx={tx.id} "
                     f"score={tx.fraud_score:.3f} account={tx.from_account}"
                 )
-                # Still store in idempotency to prevent re-processing
                 _idempotency_store[tx.idempotency_key] = tx
                 m.idempotency_cache_size.set(len(_idempotency_store))
                 return tx
 
-            # ── Step 3: Acquire lock (BUG: order of lock acquisition differs
-            #    from refund path → deadlock under concurrent load) ──────────
+            # ── Step 3: Acquire locks — consistent order: acct then order ────
+            # FIX 3: Both process_payment and process_refund now acquire
+            # _acct_lock before _order_lock, eliminating the circular wait.
             try:
                 lock_start = time.monotonic()
-                acquired = await asyncio.wait_for(_acct_lock.acquire(), timeout=3.0)
+                await asyncio.wait_for(_acct_lock.acquire(), timeout=3.0)
                 m.lock_wait_duration_seconds.labels(lock_type="account_lock").observe(
                     time.monotonic() - lock_start
                 )
@@ -183,11 +154,10 @@ class PaymentProcessor:
                     component="payment_processor", error_type="deadlock"
                 ).inc()
                 logger.error(
-                    f"[Payment] DEADLOCK: timeout acquiring account_lock "
-                    f"tx={tx.id} — concurrent refund holding lock"
+                    f"[Payment] TIMEOUT acquiring account_lock tx={tx.id}"
                 )
                 raise PaymentProcessorError(
-                    f"Deadlock: timeout acquiring account lock for tx {tx.id}"
+                    f"Timeout acquiring account lock for tx {tx.id}"
                 )
 
             try:
@@ -203,58 +173,32 @@ class PaymentProcessor:
                     component="payment_processor", error_type="deadlock"
                 ).inc()
                 logger.error(
-                    f"[Payment] DEADLOCK: timeout acquiring order_lock "
-                    f"tx={tx.id} — concurrent refund holding order lock"
+                    f"[Payment] TIMEOUT acquiring order_lock tx={tx.id}"
                 )
                 raise PaymentProcessorError(
-                    f"Deadlock: timeout acquiring order lock for tx {tx.id}"
+                    f"Timeout acquiring order lock for tx {tx.id}"
                 )
 
-            # ── Step 4: Two-phase DB write (BUG: partial commit) ─────────────
+            # ── Step 4: Atomic DB write — debit + order in ONE transaction ────
+            # FIX 2: conn.commit() is called ONCE after both writes succeed.
+            # If anything between acquire and commit raises, the finally block
+            # calls conn.rollback(), restoring the account balance atomically.
             conn = None
             try:
                 conn = db_pool.acquire()
 
-                # ── Phase 1: Debit account ────────────────────────────────────
+                # Begin explicit transaction (no autocommit).
+                # Phase 1: Debit account.
                 conn.execute(
                     "UPDATE accounts SET balance = balance - ? WHERE id = ? AND is_active = 1",
                     (tx.amount, tx.from_account),
                 )
-                conn.commit()
-                logger.debug(f"[Payment] Phase 1 complete: debited ${tx.amount:.2f} from {tx.from_account}")
+                logger.debug(
+                    f"[Payment] Phase 1 staged (not yet committed): "
+                    f"debit ${tx.amount:.2f} from {tx.from_account}"
+                )
 
-                # BUG: Intermittent failure between phase 1 and phase 2.
-                # Simulates: network timeout writing to replica, OOM on DB host,
-                # application crash (SIGKILL), etc.
-                if random.random() < settings.payment.partial_commit_rate:
-                    # Account debited, order NOT created → orphaned debit
-                    tx.mark_partial_commit(
-                        f"Phase 2 write failed after debit of ${tx.amount:.2f} "
-                        f"(intermittent DB error)"
-                    )
-                    m.partial_commits_total.inc()
-                    m.orphaned_debits_total.inc()
-                    m.payment_transactions_total.labels(
-                        status="partial_commit",
-                        method=tx.method.value,
-                        currency=tx.currency,
-                    ).inc()
-                    m.app_errors_total.labels(
-                        component="payment_processor",
-                        error_type="partial_commit",
-                    ).inc()
-                    m.app_error_rate.set(1)
-                    logger.critical(
-                        f"[Payment] PARTIAL COMMIT: tx={tx.id} account={tx.from_account} "
-                        f"debited ${tx.amount:.2f} but order confirmation FAILED. "
-                        f"ORPHANED DEBIT created."
-                    )
-                    # Record to idempotency so we don't retry
-                    _idempotency_store[tx.idempotency_key] = tx
-                    m.idempotency_cache_size.set(len(_idempotency_store))
-                    return tx
-
-                # ── Phase 2: Confirm order ────────────────────────────────────
+                # Phase 2: Confirm order — within the same transaction.
                 order_id = str(uuid.uuid4())
                 merchant_id = f"merchant_{random.randint(100, 999)}"
 
@@ -264,7 +208,7 @@ class PaymentProcessor:
                     (order_id, tx.id, merchant_id, tx.amount, datetime.utcnow().isoformat()),
                 )
 
-                # Insert transaction record
+                # Insert transaction record — still within the same transaction.
                 conn.execute(
                     """INSERT INTO transactions
                        (id, idempotency_key, from_account, to_account, amount, currency,
@@ -279,7 +223,12 @@ class PaymentProcessor:
                         tx.created_at.isoformat(), datetime.utcnow().isoformat(),
                     ),
                 )
+
+                # Single commit — both writes land together or not at all.
                 conn.commit()
+                logger.debug(
+                    f"[Payment] Atomic commit successful: debit + order confirmed for tx={tx.id}"
+                )
 
                 tx.mark_completed()
                 reconciliation_service.record_transaction(tx)
@@ -299,6 +248,15 @@ class PaymentProcessor:
                 )
 
             except (DBConnectionError, PoolExhaustedError) as e:
+                # Rollback ensures neither write persists on DB error.
+                if conn:
+                    try:
+                        conn.rollback()
+                        logger.warning(
+                            f"[Payment] Transaction rolled back for tx={tx.id} due to DB error: {e}"
+                        )
+                    except Exception:
+                        pass
                 tx.mark_failed(str(e))
                 m.payment_transactions_total.labels(
                     status="failed_db",
@@ -308,9 +266,31 @@ class PaymentProcessor:
                 m.app_errors_total.labels(
                     component="payment_processor", error_type="db_error"
                 ).inc()
-                logger.error(
-                    f"[Payment] DB error for tx={tx.id}: {e}"
-                )
+                logger.error(f"[Payment] DB error for tx={tx.id}: {e}")
+                raise
+
+            except Exception as e:
+                # Catch-all rollback: covers intermittent errors, OOM, etc.
+                # This is the specific scenario that previously caused orphaned debits.
+                if conn:
+                    try:
+                        conn.rollback()
+                        logger.warning(
+                            f"[Payment] Transaction rolled back for tx={tx.id} "
+                            f"due to unexpected error: {e} — no orphaned debit created"
+                        )
+                    except Exception:
+                        pass
+                tx.mark_failed(str(e))
+                m.payment_transactions_total.labels(
+                    status="failed",
+                    method=tx.method.value,
+                    currency=tx.currency,
+                ).inc()
+                m.app_errors_total.labels(
+                    component="payment_processor", error_type="unexpected"
+                ).inc()
+                logger.error(f"[Payment] Unexpected error for tx={tx.id}: {e}", exc_info=True)
                 raise
 
             finally:
@@ -330,7 +310,7 @@ class PaymentProcessor:
                     except RuntimeError:
                         pass
 
-            # Store in idempotency
+            # Store in idempotency cache after successful commit.
             _idempotency_store[tx.idempotency_key] = tx
             m.idempotency_cache_size.set(len(_idempotency_store))
             return tx
@@ -368,9 +348,8 @@ class PaymentProcessor:
         """
         Process a refund for a completed transaction.
 
-        BUG: Acquires locks in OPPOSITE ORDER to process_payment:
-          process_payment: _acct_lock → _order_lock
-          process_refund:  _order_lock → _acct_lock   ← DEADLOCK under concurrency
+        FIX 3: Lock acquisition order is now _acct_lock → _order_lock,
+        matching process_payment. This eliminates the circular wait deadlock.
         """
         refund_amount = amount or original_tx.amount
 
@@ -388,43 +367,44 @@ class PaymentProcessor:
         start = time.monotonic()
 
         try:
-            # BUG: Lock order reversed — order_lock first, then acct_lock
+            # FIX 3: Acquire _acct_lock first, then _order_lock —
+            # same order as process_payment, eliminating deadlock.
             try:
                 lock_start = time.monotonic()
-                await asyncio.wait_for(_order_lock.acquire(), timeout=2.5)
-                m.lock_wait_duration_seconds.labels(lock_type="order_lock").observe(
+                await asyncio.wait_for(_acct_lock.acquire(), timeout=2.5)
+                m.lock_wait_duration_seconds.labels(lock_type="account_lock").observe(
                     time.monotonic() - lock_start
                 )
             except asyncio.TimeoutError:
-                m.deadlock_events_total.labels(lock_type="order_lock").inc()
-                m.app_errors_total.labels(
-                    component="payment_processor", error_type="deadlock"
-                ).inc()
-                logger.error(
-                    f"[Refund] DEADLOCK: timeout acquiring order_lock "
-                    f"refund_tx={refund_tx.id} original_tx={original_tx.id}"
-                )
-                raise PaymentProcessorError("Deadlock: timeout acquiring order lock for refund")
-
-            try:
-                acct_start = time.monotonic()
-                await asyncio.wait_for(_acct_lock.acquire(), timeout=2.5)
-                m.lock_wait_duration_seconds.labels(lock_type="account_lock").observe(
-                    time.monotonic() - acct_start
-                )
-            except asyncio.TimeoutError:
-                _order_lock.release()
                 m.deadlock_events_total.labels(lock_type="account_lock").inc()
                 m.app_errors_total.labels(
                     component="payment_processor", error_type="deadlock"
                 ).inc()
                 logger.error(
-                    f"[Refund] DEADLOCK: timeout acquiring account_lock "
-                    f"while order_lock held. original_tx={original_tx.id}"
+                    f"[Refund] TIMEOUT acquiring account_lock "
+                    f"refund_tx={refund_tx.id} original_tx={original_tx.id}"
                 )
-                raise PaymentProcessorError("Deadlock: timeout acquiring account lock during refund")
+                raise PaymentProcessorError("Timeout acquiring account lock for refund")
 
-            # Process refund credit
+            try:
+                order_start = time.monotonic()
+                await asyncio.wait_for(_order_lock.acquire(), timeout=2.5)
+                m.lock_wait_duration_seconds.labels(lock_type="order_lock").observe(
+                    time.monotonic() - order_start
+                )
+            except asyncio.TimeoutError:
+                _acct_lock.release()
+                m.deadlock_events_total.labels(lock_type="order_lock").inc()
+                m.app_errors_total.labels(
+                    component="payment_processor", error_type="deadlock"
+                ).inc()
+                logger.error(
+                    f"[Refund] TIMEOUT acquiring order_lock "
+                    f"refund_tx={refund_tx.id} original_tx={original_tx.id}"
+                )
+                raise PaymentProcessorError("Timeout acquiring order lock during refund")
+
+            # Process refund credit atomically.
             try:
                 conn = db_pool.acquire()
                 try:
@@ -462,6 +442,16 @@ class PaymentProcessor:
                         f"original={original_tx.id} amount=${refund_amount:.2f}"
                     )
 
+                except Exception as e:
+                    try:
+                        conn.rollback()
+                        logger.warning(
+                            f"[Refund] Transaction rolled back for refund_tx={refund_tx.id}: {e}"
+                        )
+                    except Exception:
+                        pass
+                    raise
+
                 finally:
                     db_pool.release(conn)
 
@@ -470,14 +460,14 @@ class PaymentProcessor:
                 raise
 
             finally:
-                if _order_lock.locked():
-                    try:
-                        _order_lock.release()
-                    except RuntimeError:
-                        pass
                 if _acct_lock.locked():
                     try:
                         _acct_lock.release()
+                    except RuntimeError:
+                        pass
+                if _order_lock.locked():
+                    try:
+                        _order_lock.release()
                     except RuntimeError:
                         pass
 
