@@ -5,31 +5,32 @@ Architecture: rule-based scoring engine with a learned risk model (mocked).
 In a real system this would call an ML inference endpoint or a feature store.
 
 =============================================================================
-BUG: Fraud Score Cascade / Compounding
+FIX: Fraud Score Cascade / Compounding
 =============================================================================
-Root cause:
-  The FraudDetector keeps an in-memory `_score_accumulator` per account.
-  Each new check adds 30% of the previous score to the new base score.
-  The accumulator is never reset or decayed. This means:
+Root cause (fixed):
+  The original implementation kept an in-memory `_score_accumulator` per
+  account that added 30% of the previous compounded score to every new base
+  score, and never reset or decayed that value.  Over successive transactions
+  even low-risk accounts crossed the cascade threshold.
 
-    1. A legitimate transaction that scores slightly high gets stored.
-    2. The next transaction for the same account starts with a higher baseline.
-    3. Over time, even low-risk transactions compound into high scores.
-    4. Eventually all transactions from an account get flagged — cascade.
-
-Fix (NOT applied here, intentionally): use Decimal scoring per-transaction
-with no cross-transaction bleed, or reset accumulator after N minutes.
-
-Symptoms in logs:
-  ERROR fraud_detector | Fraud cascade detected for account acct_xxx: compounded_score=0.821
-
-Prometheus metrics:
-  fraud_cascade_events_total    ↑
-  fraud_false_positives_total   ↑
-  fraud_score_distribution      skews right over time
+Fix applied:
+  1. Each transaction is scored independently (compounded_score == base_score).
+  2. A separate, *decaying* risk signal is maintained per account using
+     exponential decay keyed on wall-clock time.  This lets genuine repeated
+     fraud signals accumulate while innocent accounts naturally decay to zero.
+  3. The decayed signal is available for analytics / ML features but does NOT
+     add to the per-transaction flagging decision — that is based solely on
+     the current transaction's base_score vs cfg.threshold.
+  4. False-positive tracking is corrected: a flag is a false positive only
+     when the current base_score is below threshold (i.e. the transaction
+     itself is not suspicious) regardless of history.
+  5. _check_count, _score_accumulator, and _flagged_accounts maps are pruned
+     periodically to prevent unbounded memory growth.
 """
+import math
 import random
 import logging
+import time
 from datetime import datetime
 from typing import Dict, List, Tuple
 
@@ -41,73 +42,135 @@ logger = logging.getLogger("fraud_detector")
 
 cfg = settings.fraud
 
+# Half-life in seconds for the per-account decayed risk signal.
+# After this many seconds of inactivity the signal drops to 50 % of its value.
+_DECAY_HALF_LIFE_SECONDS: float = getattr(cfg, "score_decay_half_life_seconds", 300.0)
+
+# How many entries to keep before we prune stale accounts from in-memory maps.
+_PRUNE_THRESHOLD: int = 10_000
+
 
 class FraudDetectionAgent:
     """
     Multi-rule fraud scoring engine.
     Mimics a production ML-backed fraud service.
 
-    Embedded bugs:
-      - Score accumulator per account never decays → cascade
-      - Check counter per account: high check count compounds score further
-      - False positive detection logic is wrong (over-counts)
+    Each transaction is evaluated independently.  A time-decayed risk signal
+    is maintained per account for observability and feature-engineering
+    purposes only — it does not inflate per-transaction scores.
     """
 
     def __init__(self):
-        # BUG: These maps grow unbounded and are never reset
-        self._score_accumulator: Dict[str, float] = {}
+        # Decayed risk signal: value in [0, 1] that fades over time.
+        self._decayed_risk: Dict[str, float] = {}
+        # Timestamp of the last update for each account (monotonic seconds).
+        self._last_update_ts: Dict[str, float] = {}
+        # Raw check count per account (for cascade detection counter).
         self._check_count: Dict[str, int] = {}
-        self._flagged_accounts: Dict[str, int] = {}  # account_id → flag count
-        self._recent_amounts: Dict[str, List[float]] = {}  # for velocity check
+        # Flagged-transaction count per account.
+        self._flagged_accounts: Dict[str, int] = {}
+        # Rolling amount window for velocity rule.
+        self._recent_amounts: Dict[str, List[float]] = {}
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _decayed_signal(self, account_id: str) -> float:
+        """Return the current decayed risk signal for *account_id*."""
+        raw = self._decayed_risk.get(account_id, 0.0)
+        last_ts = self._last_update_ts.get(account_id)
+        if last_ts is None or raw == 0.0:
+            return raw
+        elapsed = time.monotonic() - last_ts
+        # Exponential decay: V(t) = V0 * 0.5^(t / half_life)
+        decay_factor = math.pow(0.5, elapsed / _DECAY_HALF_LIFE_SECONDS)
+        return raw * decay_factor
+
+    def _update_decayed_signal(self, account_id: str, new_base_score: float) -> float:
+        """
+        Merge *new_base_score* into the decayed risk signal using an
+        exponential moving average and return the updated value.
+        """
+        current = self._decayed_signal(account_id)
+        # Blend: weight new evidence at 40 %, history at 60 % (after decay).
+        updated = 0.6 * current + 0.4 * new_base_score
+        updated = min(updated, 1.0)
+        self._decayed_risk[account_id] = updated
+        self._last_update_ts[account_id] = time.monotonic()
+        return updated
+
+    def _maybe_prune(self) -> None:
+        """Remove stale entries when maps exceed the prune threshold."""
+        if len(self._decayed_risk) < _PRUNE_THRESHOLD:
+            return
+        now = time.monotonic()
+        stale = [
+            acct
+            for acct, ts in self._last_update_ts.items()
+            if now - ts > _DECAY_HALF_LIFE_SECONDS * 10
+        ]
+        for acct in stale:
+            self._decayed_risk.pop(acct, None)
+            self._last_update_ts.pop(acct, None)
+            self._check_count.pop(acct, None)
+            self._flagged_accounts.pop(acct, None)
+            self._recent_amounts.pop(acct, None)
+        if stale:
+            logger.debug(f"[Fraud] Pruned {len(stale)} stale account entries")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def check(self, tx: Transaction) -> FraudCheckResult:
         """
         Score a transaction for fraud.
 
-        Returns FraudCheckResult with base + compounded scores.
-        Compounded score is what gets used for the block decision.
+        The decision is based solely on the current transaction's base_score.
+        A separate decayed risk signal is updated for analytics but does NOT
+        influence the flagging decision.
         """
         account_id = tx.from_account
         triggered_rules: List[str] = []
 
-        # ── Base rule scoring ────────────────────────────────────────────────
+        self._maybe_prune()
+
+        # ── Base rule scoring (independent per transaction) ──────────────────
         base_score, rules = self._evaluate_rules(tx)
         triggered_rules.extend(rules)
 
-        # ── BUG: Score compounding across checks ─────────────────────────────
-        previous_score = self._score_accumulator.get(account_id, 0.0)
+        # FIX: compounded_score IS the base_score — no cross-transaction bleed.
+        compounded_score = base_score  # kept for API / model compatibility
 
-        # Should be: compounded = base_score (independent per-transaction)
-        # Actual:    30% of prior score bleeds into current check → runaway
-        compounded_score = base_score + (previous_score * cfg.score_bleed_factor)
-        compounded_score = min(compounded_score, 1.0)
+        # ── Update decayed risk signal (analytics only) ───────────────────────
+        decayed_signal = self._update_decayed_signal(account_id, base_score)
 
-        # Update accumulator — only ever increases
-        self._score_accumulator[account_id] = compounded_score
-
-        # Track check count
+        # ── Track check count ────────────────────────────────────────────────
         count = self._check_count.get(account_id, 0) + 1
         self._check_count[account_id] = count
 
-        # Update velocity window
+        # ── Update velocity window ────────────────────────────────────────────
         amounts = self._recent_amounts.get(account_id, [])
         amounts.append(tx.amount)
         if len(amounts) > 20:
-            amounts = amounts[-20:]  # Rolling window (at least this part is bounded)
+            amounts = amounts[-20:]
         self._recent_amounts[account_id] = amounts
 
-        # ── Cascade detection ────────────────────────────────────────────────
+        # ── Flagging decision ────────────────────────────────────────────────
         is_flagged = compounded_score >= cfg.threshold
-        cascade_detected = False
 
-        if count >= cfg.cascade_check_count and compounded_score > 0.40:
-            # Cascade: legitimate account now permanently in elevated risk
+        # ── Cascade guard: emit metric only when decayed signal is elevated
+        #    across many checks — signals a genuinely risky account, not
+        #    an artifact of score bleed.
+        cascade_detected = False
+        if count >= cfg.cascade_check_count and decayed_signal > 0.40:
             cascade_detected = True
             m.fraud_cascade_events_total.inc()
-            triggered_rules.append("cascade:score_runaway")
+            triggered_rules.append("cascade:persistent_risk")
             logger.error(
                 f"[Fraud] CASCADE DETECTED account={account_id} "
-                f"base_score={base_score:.3f} compounded={compounded_score:.3f} "
+                f"base_score={base_score:.3f} decayed_signal={decayed_signal:.3f} "
                 f"check_count={count} tx_id={tx.id}"
             )
             m.app_error_rate.set(1)
@@ -115,21 +178,19 @@ class FraudDetectionAgent:
                 component="fraud_detector", error_type="cascade"
             ).inc()
 
-        # ── False positive tracking (flawed logic) ────────────────────────────
+        # ── False positive tracking (corrected) ───────────────────────────────
         if is_flagged:
             flag_count = self._flagged_accounts.get(account_id, 0) + 1
             self._flagged_accounts[account_id] = flag_count
 
-            # BUG: We consider it a false positive if the account has been
-            # flagged more than 2 times AND the base score alone wouldn't flag it.
-            # This is wrong: cascade itself causes the over-flagging, but we
-            # record it as false_positive regardless.
-            if flag_count > 2 and base_score < cfg.threshold:
+            # FIX: a false positive is when THIS transaction's base_score is
+            # below threshold — meaning the transaction itself is not suspicious
+            # and the flag was not warranted by current evidence.
+            if base_score < cfg.threshold:
                 m.fraud_false_positives_total.inc()
                 logger.warning(
                     f"[Fraud] Likely FALSE POSITIVE account={account_id} "
-                    f"base_score={base_score:.3f} compounded={compounded_score:.3f} "
-                    f"flag_count={flag_count} tx_id={tx.id}"
+                    f"base_score={base_score:.3f} flag_count={flag_count} tx_id={tx.id}"
                 )
 
         # ── Prometheus metrics ────────────────────────────────────────────────
@@ -191,7 +252,6 @@ class FraudDetectionAgent:
             rules.append("cross_currency")
 
         # Rule 5: Simulated ML model score (Gaussian noise around 0.08)
-        # Represents a real model that scores slightly high on average
         ml_score = random.gauss(0.08, 0.04)
         ml_score = max(0.0, min(ml_score, 0.30))
         score += ml_score
@@ -213,16 +273,18 @@ class FraudDetectionAgent:
     def get_account_risk_profile(self, account_id: str) -> dict:
         return {
             "account_id": account_id,
-            "accumulated_score": self._score_accumulator.get(account_id, 0.0),
+            "decayed_risk_signal": self._decayed_signal(account_id),
             "check_count": self._check_count.get(account_id, 0),
             "flag_count": self._flagged_accounts.get(account_id, 0),
         }
 
     def reset_account(self, account_id: str):
         """Reset fraud state for an account (used by ops team manually)."""
-        self._score_accumulator.pop(account_id, None)
+        self._decayed_risk.pop(account_id, None)
+        self._last_update_ts.pop(account_id, None)
         self._check_count.pop(account_id, None)
         self._flagged_accounts.pop(account_id, None)
+        self._recent_amounts.pop(account_id, None)
         logger.info(f"[Fraud] Account {account_id} fraud state reset")
 
 
