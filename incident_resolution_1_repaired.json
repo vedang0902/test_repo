@@ -6,13 +6,13 @@
         "path": "incident-alert",
         "options": {}
       },
-      "id": "cb911548-45cd-46d9-a594-d34a729b2640",
+      "id": "fd672502-5ba2-43d7-8d67-5dd3910f64d9",
       "name": "Webhook1",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
       "position": [
-        3584,
-        3456
+        11056,
+        4560
       ],
       "webhookId": "incident-alert"
     },
@@ -20,13 +20,13 @@
       "parameters": {
         "jsCode": "// Dynamically select the right source file based on the bug label\nconst alert = $('Webhook1').item.json.body?.alerts?.[0];\nconst bugLabel = alert?.labels?.bug || '';\nconst alertname = alert?.labels?.alertname || '';\n\nconst bugToFile = {\n  'partial_commit':       'app/services/payment_processor.py',\n  'deadlock':             'app/services/payment_processor.py',\n  'idempotency_race':     'app/services/payment_processor.py',\n  'fraud_cascade':        'app/services/fraud_detector.py',\n  'float_drift':          'app/services/reconciliation.py',\n  'webhook_retry_storm':  'app/services/webhook_service.py',\n  'memory_leak':          'app/services/transaction_generator.py',\n};\n\nconst alertToFile = {\n  'DBPoolExhausted':           'app/database.py',\n  'DBPoolLow':                 'app/database.py',\n  'DBConnectionErrors':        'app/database.py',\n  'TransactionCacheGrowing':   'app/services/transaction_generator.py',\n  'TransactionCacheCritical':  'app/services/transaction_generator.py',\n};\n\nconst repoRoot = 'n8n support files/test_repo';\nconst localPath = bugToFile[bugLabel] || alertToFile[alertname] || 'app/services/payment_processor.py';\n\n// URL-encode each path segment (handles spaces in \"n8n support files\")\nconst filePath = (repoRoot + '/' + localPath)\n  .split('/')\n  .map(seg => encodeURIComponent(seg))\n  .join('/');\n\nreturn {\n  json: {\n    owner: 'vedang0902',\n    repository: 'test_repo',\n    path: filePath\n  }\n};"
       },
-      "id": "d04fe223-5526-4064-a31c-c5fea1c70549",
+      "id": "eb6a1f41-ea2a-44fa-bc6a-56f4b5866890",
       "name": "Repo Config1",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3584,
-        3168
+        11056,
+        4272
       ]
     },
     {
@@ -55,30 +55,29 @@
         },
         "options": {}
       },
-      "id": "30b2c3dd-4749-4afc-8d9e-f3d2255d6110",
+      "id": "38c368dc-6254-4055-a9d0-82365656c45c",
       "name": "Fetch Prometheus Metrics1",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        3792,
-        3552
+        11264,
+        4656
       ]
     },
     {
       "parameters": {
-        "method": "GET",
         "url": "=https://api.github.com/repos/{{ $json.owner }}/{{ $json.repository }}/contents/{{ $json.path }}",
         "authentication": "predefinedCredentialType",
         "nodeCredentialType": "githubApi",
         "options": {}
       },
-      "id": "bd790342-63ec-42f2-b29c-2de758b4a9d3",
+      "id": "82f5fd83-aad8-4fb9-b933-25fcebb03dd5",
       "name": "Get Repo File1",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        3792,
-        3312
+        11264,
+        4416
       ],
       "webhookId": "293ceb1c-687b-41e3-a888-1613ad369a10",
       "credentials": {
@@ -92,111 +91,119 @@
       "parameters": {
         "jsCode": "// Parse Prometheus query_range response format:\n// { status: 'success', data: { resultType: 'matrix', result: [{ metric: {}, values: [[ts, val], ...] }] } }\nconst raw = $input.item.json;\nlet metric_value = 0;\nlet metric_name = 'unknown';\ntry {\n  const result = raw?.data?.result?.[0];\n  if (result) {\n    metric_name = result.metric?.__name__ || Object.values(result.metric || {})[0] || 'unknown';\n    // values is array of [timestamp, value_string] \u2014 take the last point\n    const lastPoint = result.values?.slice(-1)?.[0];\n    metric_value = lastPoint ? parseFloat(lastPoint[1]) : 0;\n  }\n} catch (e) {\n  metric_value = 0;\n}\nconst webhookJson = $('Webhook1').item.json;\nconst raw_alert = webhookJson.body || webhookJson;\nconst amAlert = raw_alert.alerts?.[0];\nreturn {\n  json: {\n    metrics: {\n      metric_name,\n      current_value: metric_value,\n      source: 'prometheus',\n      alertname: amAlert?.labels?.alertname || raw_alert.alertname || 'unknown',\n      bug_label: amAlert?.labels?.bug || '',\n      severity: amAlert?.labels?.severity || raw_alert.severity || 'unknown'\n    },\n    raw_alert\n  }\n};"
       },
-      "id": "b7147182-39ff-46a1-89cf-1c548660f606",
+      "id": "a14fa779-8c62-44a0-af86-a2f8177b65df",
       "name": "Normalize Metrics1",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3984,
-        3552
+        11456,
+        4656
       ]
     },
     {
       "parameters": {
         "jsCode": "const item = $input.item.json;\nlet repo_file_content = '';\nif (typeof item.content === 'string') {\n  try { repo_file_content = Buffer.from(item.content, 'base64').toString('utf8'); } catch (e) { repo_file_content = item.content; }\n} else if (item.data?.content) {\n  try { repo_file_content = Buffer.from(item.data.content, 'base64').toString('utf8'); } catch (e) { repo_file_content = item.data.content; }\n} else { repo_file_content = typeof item === 'string' ? item : JSON.stringify(item); }\n// Capture the file's blob sha too - required later to commit an update to\n// this same file via the GitHub Contents API.\nconst repo_file_sha = item.sha || item.data?.sha || '';\nreturn { json: { repo_file_content, repo_file_sha } };"
       },
-      "id": "0bb4916a-b67b-4bd2-ae5b-0d16191eded4",
+      "id": "44c091d0-32a2-4220-9bee-b038935c0d2f",
       "name": "Extract File1",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3984,
-        3312
+        11456,
+        4416
       ]
     },
     {
       "parameters": {},
-      "id": "7aa911d0-9571-44f5-ae62-c8d277cce9be",
+      "id": "e9fd1198-e9ce-4469-9aba-71e8abc218d7",
       "name": "Merge1",
       "type": "n8n-nodes-base.merge",
       "typeVersion": 3,
       "position": [
-        4192,
-        3440
+        11664,
+        4544
       ]
     },
     {
       "parameters": {
-        "jsCode": "const items = $input.all();\nconst metricsItem = items.find(i => i.json.metrics) || items[0];\nconst repoItem = items.find(i => i.json.repo_file_content !== undefined) || items[1] || items[0];\nconst metrics = metricsItem?.json?.metrics || {};\nconst raw_alert = metricsItem?.json?.raw_alert || {};\nconst repo = repoItem?.json?.repo_file_content ?? '';\nconst repo_file_sha = repoItem?.json?.repo_file_sha || '';\n\n// Support Alertmanager-style payloads (alerts[]) as well as flatter monitor\n// webhook bodies (title/text/severity at the top level) - the actual shape\n// depends on what's calling the webhook, so both are handled defensively.\nconst amAlert = raw_alert.alerts?.[0];\nconst incident = amAlert ? {\n  name: amAlert.labels?.alertname || 'unknown',\n  severity: amAlert.labels?.severity || 'unknown',\n  summary: amAlert.annotations?.summary || '',\n  started_at: amAlert.startsAt || '',\n  status: raw_alert.status || ''\n} : {\n  name: raw_alert.alertname || raw_alert.title || raw_alert.name || 'unknown',\n  severity: raw_alert.severity || raw_alert.priority || 'unknown',\n  summary: raw_alert.summary || raw_alert.text || raw_alert.body || '',\n  started_at: raw_alert.date || raw_alert.started_at || '',\n  status: raw_alert.status || raw_alert.alert_type || ''\n};\n\nconst github = $('Repo Config1').item.json;\n\nreturn {\n  json: {\n    incident,\n    metrics,\n    repo_files: { app_py: typeof repo === 'string' ? repo : JSON.stringify(repo) },\n    repo_file_sha,\n    github: { owner: github.owner, repository: github.repository, path: github.path }\n  }\n};"
+        "jsCode": "const items = $input.all();\nconst metricsItem = items.find(i => i.json.metrics) || items[0];\nconst repoItem = items.find(i => i.json.repo_file_content !== undefined) || items[1] || items[0];\nconst metrics = metricsItem?.json?.metrics || {};\nconst raw_alert = metricsItem?.json?.raw_alert || {};\nconst repo = repoItem?.json?.repo_file_content ?? '';\nconst repo_file_sha = repoItem?.json?.repo_file_sha || '';\n\nconst amAlert = raw_alert.alerts?.[0];\nconst incident = amAlert ? {\n  name: amAlert.labels?.alertname || 'unknown',\n  severity: amAlert.labels?.severity || 'unknown',\n  summary: amAlert.annotations?.summary || '',\n  started_at: amAlert.startsAt || '',\n  status: raw_alert.status || ''\n} : {\n  name: raw_alert.alertname || raw_alert.title || raw_alert.name || 'unknown',\n  severity: raw_alert.severity || raw_alert.priority || 'unknown',\n  summary: raw_alert.summary || raw_alert.text || raw_alert.body || '',\n  started_at: raw_alert.date || raw_alert.started_at || '',\n  status: raw_alert.status || raw_alert.alert_type || ''\n};\n\nconst bugLabel = amAlert?.labels?.bug || '';\nconst alertname = amAlert?.labels?.alertname || '';\nconst bugToFile = {\n  'partial_commit':       'app/services/payment_processor.py',\n  'deadlock':             'app/services/payment_processor.py',\n  'idempotency_race':     'app/services/payment_processor.py',\n  'fraud_cascade':        'app/services/fraud_detector.py',\n  'float_drift':          'app/services/reconciliation.py',\n  'webhook_retry_storm':  'app/services/webhook_service.py',\n  'memory_leak':          'app/services/transaction_generator.py',\n};\nconst alertToFile = {\n  'DBPoolExhausted':          'app/database.py',\n  'DBPoolLow':                'app/database.py',\n  'TransactionCacheGrowing':  'app/services/transaction_generator.py',\n};\nconst repoRoot = 'n8n support files/test_repo';\nconst localPath = bugToFile[bugLabel] || alertToFile[alertname] || 'app/services/payment_processor.py';\nconst filePath = (repoRoot + '/' + localPath).split('/').map(seg => encodeURIComponent(seg)).join('/');\n\nconst fileContent = typeof repo === 'string' ? repo : JSON.stringify(repo);\nconst promptText = `You are an SRE. Analyze the incident using the provided metrics and code, then propose a fix.\n\nReturn valid JSON only with these exact keys:\n- root_cause: string describing the root cause\n- fix_summary: string (1-2 sentences suitable for a PR description)\n- patched_code: string (the FULL corrected content of the file, not a diff)\n- risk: one of: low, medium, high\n\nIncident: ${JSON.stringify(incident)}\nMetrics: ${JSON.stringify(metrics)}\nCurrent file (${localPath}):\n${fileContent}`;\n\nreturn {\n  json: {\n    incident,\n    metrics,\n    repo_file_sha,\n    github: { owner: 'vedang0902', repository: 'test_repo', path: filePath, local_path: localPath },\n    ai_request: {\n      model: 'claude-sonnet-4-6',\n      max_tokens: 8192,\n      messages: [\n        { role: 'user', content: promptText }\n      ]\n    }\n  }\n};"
       },
-      "id": "47e0ab3c-109a-4de7-b1bf-e67f7b11b30c",
+      "id": "03d23c87-1425-4d0e-ac3f-a5e708833a4e",
       "name": "Compose AI Input1",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        4384,
-        3440
+        11856,
+        4544
       ]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+        "url": "https://api.anthropic.com/v1/messages",
         "authentication": "genericCredentialType",
-        "genericAuthType": "httpQueryAuth",
+        "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
             {
               "name": "Content-Type",
               "value": "application/json"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
             }
           ]
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'You are an SRE. Analyze the incident using the provided metrics and code, then propose a fix. Return valid JSON only with keys: root_cause (string), fix_summary (string, 1-2 sentences suitable for a PR description), patched_code (string, the FULL corrected content of the file - not a diff), risk (one of: low, medium, high). Incident: ' + JSON.stringify($json.incident) + ' Metrics: ' + JSON.stringify($json.metrics) + ' Current file (' + ($json.github?.path || 'app.py') + '): ' + ($json.repo_files?.app_py || '') }] }], generationConfig: { responseMimeType: 'application/json' } }) }}",
-        "options": {}
+        "options": {},
+        "jsonBody": "={{ JSON.stringify($json.ai_request) }}"
       },
-      "id": "f9091e04-88af-4ddf-8104-ff7f4e90d087",
+      "id": "30250641-dd2e-4d4f-97d7-dc76a5dc0214",
       "name": "AI Incident Analysis1",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        4592,
-        3440
+        12064,
+        4544
       ],
       "credentials": {
         "httpQueryAuth": {
           "id": "1PvbZmzIBX7r1riE",
           "name": "Query Auth account"
+        },
+        "httpHeaderAuth": {
+          "id": "sIgJUh0gwXq4cKhT",
+          "name": "Header Auth account"
         }
       }
     },
     {
       "parameters": {
-        "jsCode": "const raw = $input.item.json;\nlet ai;\ntry {\n  const text = raw?.candidates?.[0]?.content?.parts?.[0]?.text || raw?.text || '';\n  const cleaned = text.replace(/```json\\n?|```/g, '').trim();\n  ai = JSON.parse(cleaned);\n} catch (e) {\n  ai = { root_cause: 'Invalid AI output', fix_summary: 'Manual review needed', patched_code: '', risk: 'high' };\n}\n// The HTTP node above overwrote json with the Gemini response, so pull the\n// incident/github/file context back from Compose AI Input instead of trying\n// to carry it through the API call.\nconst context = $('Compose AI Input1').item.json;\nreturn {\n  json: {\n    ai,\n    incident: context.incident,\n    github: context.github,\n    repo_file_sha: context.repo_file_sha\n  }\n};"
+        "jsCode": "const raw = $input.item.json;\n\n// Anthropic response: content[0].text; Gemini fallback: candidates[0].content.parts[0].text\nlet text = '';\nif (raw?.content && Array.isArray(raw.content)) {\n  text = raw.content[0]?.text || '';\n} else if (raw?.candidates) {\n  text = raw.candidates[0]?.content?.parts?.[0]?.text || '';\n} else {\n  text = raw?.text || '';\n}\n\n// Strip markdown code fences\nconst cleaned = text.replace(/^```(?:json)?\\n?|```$/gm, '').trim();\n\n// Sanitize literal control characters inside JSON string values.\n// The AI often embeds Python source code with real newlines/tabs inside\n// a JSON string \u2014 JSON.parse rejects those unless they are \\-escaped.\nfunction sanitizeJsonStrings(s) {\n  let out = '';\n  let inStr = false;\n  let esc = false;\n  for (let i = 0; i < s.length; i++) {\n    const ch = s[i];\n    const code = s.charCodeAt(i);\n    if (esc) { out += ch; esc = false; continue; }\n    if (ch === '\\\\' && inStr) { out += ch; esc = true; continue; }\n    if (ch === '\"') { out += ch; inStr = !inStr; continue; }\n    if (inStr && code < 0x20) {\n      // Escape literal control char\n      if (code === 0x0a) out += '\\\\n';\n      else if (code === 0x0d) out += '\\\\r';\n      else if (code === 0x09) out += '\\\\t';\n      else out += '\\\\u' + code.toString(16).padStart(4, '0');\n      continue;\n    }\n    out += ch;\n  }\n  return out;\n}\n\nlet ai;\ntry {\n  ai = JSON.parse(sanitizeJsonStrings(cleaned));\n} catch (e) {\n  // Last-resort: try raw cleaned string\n  try { ai = JSON.parse(cleaned); } catch (_) {\n    ai = {\n      root_cause: 'Parse error: ' + e.message,\n      fix_summary: 'Manual review needed',\n      patched_code: '',\n      risk: 'high'\n    };\n  }\n}\n\nconst context = $('Compose AI Input1').item.json;\nreturn {\n  json: {\n    ai,\n    incident: context.incident,\n    github: context.github,\n    repo_file_sha: context.repo_file_sha\n  }\n};"
       },
-      "id": "290d9d96-0da6-47d0-bac3-6554904fad9f",
+      "id": "b85008d2-fbf1-4317-bf2f-d9709bbca7a6",
       "name": "Parse AI Output1",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        4784,
-        3440
+        12256,
+        4544
       ]
     },
     {
       "parameters": {
         "jsCode": "const { ai, incident, github, repo_file_sha } = $input.item.json;\nconst safeRisk = ['low', 'medium'].includes(ai.risk);\nconst hasPatch = typeof ai.patched_code === 'string' && ai.patched_code.trim().length > 0;\nconst ok = safeRisk && hasPatch;\nreturn {\n  json: {\n    ok,\n    reason: ok ? '' : (!hasPatch ? 'AI did not return a patch' : 'Risk level too high: ' + ai.risk),\n    ai,\n    incident,\n    github,\n    repo_file_sha,\n    branch: 'ai-fix-' + Date.now()\n  }\n};"
       },
-      "id": "bb107aed-a044-4089-ac68-911568c013e4",
+      "id": "efbaf5c6-89c6-43d3-b6d1-c0fa96893d17",
       "name": "Patch Validator1",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        4992,
-        3440
+        12464,
+        4544
       ]
     },
     {
@@ -224,31 +231,26 @@
         },
         "options": {}
       },
-      "id": "bbc1aafd-93ce-426c-92b6-43cf6c23bfad",
+      "id": "b9843392-0452-482f-938f-18f66fc96b43",
       "name": "Is Patch Safe?1",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        5200,
-        3440
+        12672,
+        4544
       ]
     },
     {
       "parameters": {
-        "fromEmail": "vedangkane@gmail.com",
-        "toEmail": "vedangkane@gmail.com",
-        "subject": "=[Incident] Manual review needed - {{ $json.incident.name }}",
-        "emailFormat": "text",
-        "text": "=The AI could not produce a safe automatic fix for this incident and it needs manual review.\n\nIncident: {{ $json.incident.name }} (severity: {{ $json.incident.severity }})\nReason: {{ $json.reason }}\nRoot cause (AI): {{ $json.ai.root_cause }}\nRisk (AI): {{ $json.ai.risk }}\n\nPlease investigate manually.",
-        "options": {}
+        "jsCode": "// Email skipped (no SMTP configured) \u2014 log incident for manual review\nconst d = $input.item.json;\nconsole.log('[MANUAL REVIEW NEEDED]', JSON.stringify({\n  incident: d.incident?.name,\n  severity: d.incident?.severity,\n  reason: d.reason,\n  root_cause: d.ai?.root_cause,\n  risk: d.ai?.risk\n}, null, 2));\nreturn { json: { ...$input.item.json, notification_sent: false, notification_skipped: 'no_smtp' } };"
       },
-      "id": "3b82015e-3e80-43c1-9641-b000452e96ed",
+      "id": "263c4884-bf4a-41ce-a468-eac5e9571491",
       "name": "Notify Manual Review Email2",
-      "type": "n8n-nodes-base.emailSend",
-      "typeVersion": 2.1,
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
-        5456,
-        3600
+        12928,
+        4704
       ],
       "webhookId": "90e7bd69-a349-4cd4-bdd6-4e4fa3854d14",
       "credentials": {
@@ -260,20 +262,15 @@
     },
     {
       "parameters": {
-        "fromEmail": "vedangkane@gmail.com",
-        "toEmail": "vedangkane@gmail.com",
-        "subject": "=[AI Fix] PR opened for {{ $('Patch Validator').item.json.incident.name }}",
-        "emailFormat": "text",
-        "text": "=An incident was detected and an AI-generated fix has been opened for review.\n\nIncident: {{ $('Patch Validator').item.json.incident.name }} (severity: {{ $('Patch Validator').item.json.incident.severity }})\nRoot cause: {{ $('Patch Validator').item.json.ai.root_cause }}\nFix summary: {{ $('Patch Validator').item.json.ai.fix_summary }}\nRisk: {{ $('Patch Validator').item.json.ai.risk }}\nBranch: {{ $('Patch Validator').item.json.branch }}\nPull request: {{ $json.html_url }}\n\nPlease review and merge manually.",
-        "options": {}
+        "jsCode": "// Email skipped (no SMTP configured) \u2014 log PR creation success\nconst d = $input.item.json;\nconsole.log('[AI FIX PR CREATED]', JSON.stringify({\n  incident: d.incident?.name,\n  pr_url: d.html_url || d.pr_url || 'unknown',\n  branch: d.branch,\n  risk: d.ai?.risk\n}, null, 2));\nreturn { json: { ...$input.item.json, notification_sent: false, notification_skipped: 'no_smtp' } };"
       },
-      "id": "abdaba82-52f3-4239-8789-b9f1b6a536b4",
+      "id": "426d7f61-bfad-4300-96c0-6bf7328593f1",
       "name": "Notify Success Email2",
-      "type": "n8n-nodes-base.emailSend",
-      "typeVersion": 2.1,
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
-        6256,
-        3312
+        13728,
+        4416
       ],
       "webhookId": "c7726de1-3ad1-4240-b5c9-e0a5b37df2c7",
       "credentials": {
@@ -286,7 +283,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "=https://api.github.com/repos/{{ $('Patch Validator').item.json.github.owner }}/{{ $('Patch Validator').item.json.github.repository }}/pulls",
+        "url": "=https://api.github.com/repos/{{ $('Prepare Commit Payload').item.json.github.owner }}/{{ $('Prepare Commit Payload').item.json.github.repository }}/pulls",
         "authentication": "predefinedCredentialType",
         "nodeCredentialType": "githubApi",
         "sendHeaders": true,
@@ -300,16 +297,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ title: 'AI incident fix: ' + $('Patch Validator').item.json.incident.name, head: $('Patch Validator').item.json.branch, base: 'main', body: 'Root cause: ' + $('Patch Validator').item.json.ai.root_cause + '\\n\\nFix summary: ' + $('Patch Validator').item.json.ai.fix_summary + '\\n\\nRisk: ' + $('Patch Validator').item.json.ai.risk + '\\n\\n_Automatically generated by the incident-repair workflow._' }) }}",
-        "options": {}
+        "options": {},
+        "jsonBody": "={{ $('Prepare Commit Payload').item.json.pr_payload }}"
       },
-      "id": "225d4faa-a02d-4d7c-8cef-d754123b8789",
+      "id": "898dff94-aa1b-43de-ac47-f6621414c5a5",
       "name": "Create Pull Request2",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        6064,
-        3312
+        13536,
+        4416
       ],
       "credentials": {
         "githubApi": {
@@ -321,7 +318,7 @@
     {
       "parameters": {
         "method": "PUT",
-        "url": "=https://api.github.com/repos/{{ $('Patch Validator').item.json.github.owner }}/{{ $('Patch Validator').item.json.github.repository }}/contents/{{ $('Patch Validator').item.json.github.path }}",
+        "url": "=https://api.github.com/repos/{{ $json.github.owner }}/{{ $json.github.repository }}/contents/{{ $json.github.path }}",
         "authentication": "predefinedCredentialType",
         "nodeCredentialType": "githubApi",
         "sendHeaders": true,
@@ -335,16 +332,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ message: 'AI fix: ' + $('Patch Validator').item.json.ai.fix_summary, content: Buffer.from($('Patch Validator').item.json.ai.patched_code).toString('base64'), sha: $('Patch Validator').item.json.repo_file_sha, branch: $('Patch Validator').item.json.branch }) }}",
-        "options": {}
+        "options": {},
+        "jsonBody": "={{ $json.commit_payload }}"
       },
-      "id": "23ad0eb8-383f-46a5-a78d-a00170aaaac4",
+      "id": "d893c1c3-e6b6-46f2-b5ab-3b1636ea7d2b",
       "name": "Commit Patched File2",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        5856,
-        3312
+        13328,
+        4416
       ],
       "credentials": {
         "githubApi": {
@@ -356,7 +353,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "=https://api.github.com/repos/{{ $('Patch Validator').item.json.github.owner }}/{{ $('Patch Validator').item.json.github.repository }}/git/refs",
+        "url": "=https://api.github.com/repos/{{ $('Patch Validator1').item.json.github.owner }}/{{ $('Patch Validator1').item.json.github.repository }}/git/refs",
         "authentication": "predefinedCredentialType",
         "nodeCredentialType": "githubApi",
         "sendHeaders": true,
@@ -370,16 +367,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ ref: 'refs/heads/' + $('Patch Validator').item.json.branch, sha: $json.object.sha }) }}",
+        "jsonBody": "={{ JSON.stringify({ ref: 'refs/heads/' + $('Patch Validator1').item.json.branch, sha: $json.object.sha }) }}",
         "options": {}
       },
-      "id": "eca3d7de-906b-49df-a9be-0e2d6170a53e",
+      "id": "a1429306-f46d-4546-b070-304d94867576",
       "name": "Create Branch2",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        5664,
-        3312
+        13136,
+        4416
       ],
       "credentials": {
         "githubApi": {
@@ -404,13 +401,13 @@
         },
         "options": {}
       },
-      "id": "55e9e26f-cdac-4b3f-a721-dd7a5c9fdc3f",
+      "id": "fb1e360b-a793-4bf6-91c1-bcbf1e928674",
       "name": "Get Main Branch SHA2",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        5456,
-        3312
+        12928,
+        4416
       ],
       "credentials": {
         "githubApi": {
@@ -418,6 +415,19 @@
           "name": "GitHub account 2"
         }
       }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Base64-encode the patched file and build both the commit + PR payloads.\n// Buffer is available in Code nodes (not in expression fields).\nconst pv = $('Patch Validator1').item.json;\nconst encoded = Buffer.from(pv.ai.patched_code || '', 'utf8').toString('base64');\n\nconst commitPayload = JSON.stringify({\n  message: 'AI fix: ' + (pv.ai.fix_summary || 'automated patch'),\n  content: encoded,\n  sha: pv.repo_file_sha,\n  branch: pv.branch\n});\n\nconst prPayload = JSON.stringify({\n  title: 'AI incident fix: ' + pv.incident.name,\n  head: pv.branch,\n  base: 'main',\n  body: [\n    '**Root cause:** ' + pv.ai.root_cause,\n    '',\n    '**Fix summary:** ' + pv.ai.fix_summary,\n    '',\n    '**Risk:** ' + pv.ai.risk,\n    '',\n    '_Automatically generated by the incident-repair workflow._'\n  ].join('\\n')\n});\n\nreturn {\n  json: {\n    commit_payload: commitPayload,\n    pr_payload: prPayload,\n    github: pv.github,\n    incident: pv.incident,\n    ai: pv.ai,\n    branch: pv.branch\n  }\n};"
+      },
+      "id": "prep-commit-payload-001",
+      "name": "Prepare Commit Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4400,
+        3200
+      ]
     }
   ],
   "connections": {
@@ -591,7 +601,7 @@
       "main": [
         [
           {
-            "node": "Commit Patched File2",
+            "node": "Prepare Commit Payload",
             "type": "main",
             "index": 0
           }
@@ -603,6 +613,17 @@
         [
           {
             "node": "Create Branch2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Commit Payload": {
+      "main": [
+        [
+          {
+            "node": "Commit Patched File2",
             "type": "main",
             "index": 0
           }

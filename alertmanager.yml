@@ -2,7 +2,7 @@ global:
   smtp_smarthost: 'smtp.gmail.com:587'
   smtp_from: 'vedangkane@gmail.com'
   smtp_auth_username: 'vedangkane@gmail.com'
-  smtp_auth_password: 'YOUR_GMAIL_APP_PASSWORD'
+  smtp_auth_password: 'onfi wufy xxsw iodc'
 
 route:
   receiver: 'email-and-webhook'

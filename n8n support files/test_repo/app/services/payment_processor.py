@@ -85,7 +85,7 @@ _idempotency_store: Dict[str, Transaction] = {}
 # ── Deadlock-prone locks ──────────────────────────────────────────────────────
 # BUG: payment acquires _acct_lock then _order_lock
 #      refund acquires _order_lock then _acct_lock  → classic deadlock
-_acct_lock = asyncio.Lock()
+_acct_lock =  asyncio.Lock()
 _order_lock = asyncio.Lock()
 
 
