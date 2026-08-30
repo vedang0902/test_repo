@@ -26,19 +26,23 @@ Fix (NOT applied): Use asyncio.Lock per key, or a DB unique constraint with
   INSERT OR IGNORE and read-back.
 
 =============================================================================
-BUG 2: Partial Transaction Commit (Orphaned Debit)
+BUG 2: Partial Transaction Commit (Orphaned Debit) — FIXED
 =============================================================================
-Root cause:
+Previous root cause:
   Payment processing is a two-phase write:
-    Phase 1: UPDATE accounts SET balance = balance - amount
+    Phase 1: UPDATE accounts SET balance = balance - amount  → conn.commit()  ← BUG
     Phase 2: INSERT INTO orders (transaction_id, status='confirmed')
 
-  Between phase 1 and phase 2, the mock DB throws an intermittent error
-  (simulates: network partition, PG write timeout, OOM kill of DB slave).
+  Between phase 1 and phase 2, the mock DB throws an intermittent error.
   The account is debited but no confirmed order exists — an orphaned debit.
 
-Fix (NOT applied): Wrap both phases in a DB transaction with ACID guarantees.
-  Use saga pattern with compensating transaction (credit back) on failure.
+Fix (APPLIED):
+  - Removed the premature conn.commit() after Phase 1.
+  - Both Phase 1 (debit) and Phase 2 (order + transaction insert) now execute
+    within a single DB transaction committed only after all writes succeed.
+  - On any failure after Phase 1 executes (e.g. mid-flight crash where rollback
+    may not reach the DB), a compensating credit is issued as a saga rollback
+    to restore the account balance.
 
 =============================================================================
 BUG 3: Deadlock on Lock Ordering
@@ -107,10 +111,64 @@ class InsufficientFundsError(PaymentProcessorError):
 
 class PaymentProcessor:
 
+    async def _compensate_debit(
+        self,
+        tx: Transaction,
+        debit_confirmed: bool,
+    ) -> None:
+        """
+        Saga compensating action: credit back the account when the atomic
+        transaction could not be rolled back (e.g. connection lost after
+        the UPDATE was flushed but before COMMIT, or COMMIT succeeded on
+        the debit leg only due to a proxy/driver quirk).
+
+        This is a best-effort safety net. Failures here are logged as
+        CRITICAL and must be resolved by the on-call engineer.
+        """
+        if not debit_confirmed:
+            # The debit never reached the DB (exception before execute),
+            # so no compensation is needed.
+            return
+
+        try:
+            comp_conn = db_pool.acquire()
+            try:
+                comp_conn.execute(
+                    "UPDATE accounts SET balance = balance + ? WHERE id = ? AND is_active = 1",
+                    (tx.amount, tx.from_account),
+                )
+                comp_conn.commit()
+                logger.warning(
+                    f"[Payment] SAGA COMPENSATE: credited back ${tx.amount:.2f} "
+                    f"to account={tx.from_account} for failed tx={tx.id}"
+                )
+                m.app_errors_total.labels(
+                    component="payment_processor",
+                    error_type="saga_compensation_applied",
+                ).inc()
+            finally:
+                db_pool.release(comp_conn)
+        except Exception as comp_exc:
+            # Compensation itself failed — this requires manual intervention.
+            logger.critical(
+                f"[Payment] SAGA COMPENSATION FAILED: could not credit back "
+                f"${tx.amount:.2f} to account={tx.from_account} for tx={tx.id}. "
+                f"Manual reconciliation required. error={comp_exc}",
+                exc_info=True,
+            )
+            m.app_errors_total.labels(
+                component="payment_processor",
+                error_type="saga_compensation_failed",
+            ).inc()
+            m.orphaned_debits_total.inc()
+
     async def process_payment(self, tx: Transaction) -> Transaction:
         """
         Full payment processing pipeline.
-        Contains BUG 1 (race condition) and BUG 2 (partial commit).
+        BUG 2 (partial commit) FIXED: both DB phases now execute inside a
+        single atomic transaction with a compensating rollback on failure.
+        BUG 1 (race condition) and BUG 3 (deadlock) are documented but
+        not yet fixed in this patch.
         """
         start = time.monotonic()
         m.active_payment_requests.inc()
@@ -210,51 +268,53 @@ class PaymentProcessor:
                     f"Deadlock: timeout acquiring order lock for tx {tx.id}"
                 )
 
-            # ── Step 4: Two-phase DB write (BUG: partial commit) ─────────────
+            # ── Step 4: Atomic two-phase DB write (BUG 2 FIXED) ──────────────
+            #
+            # FIX: Both the account debit (Phase 1) and the order/transaction
+            # inserts (Phase 2) are now executed within a SINGLE database
+            # transaction.  conn.commit() is called exactly once, only after
+            # ALL writes have been staged.  If anything fails before that
+            # commit, conn.rollback() undoes every staged write atomically so
+            # no orphaned debit can exist in the database.
+            #
+            # Additionally, a saga compensating credit is issued as a last-
+            # resort safety net for the edge case where the connection is lost
+            # after the DB has flushed but before the driver receives the
+            # COMMIT acknowledgement (i.e. the commit is ambiguous).
             conn = None
+            # Tracks whether the Phase 1 UPDATE has been sent to the DB so we
+            # know whether a compensating credit is needed on failure.
+            debit_executed = False
+
             try:
                 conn = db_pool.acquire()
 
-                # ── Phase 1: Debit account ────────────────────────────────────
+                # Simulate intermittent inter-phase failure BEFORE we start
+                # writing so we can decide whether to trigger the error path.
+                # (Moved the random check here so it governs the whole txn.)
+                inject_failure = random.random() < settings.payment.partial_commit_rate
+
+                # ── Phase 1: Debit account (no commit yet) ───────────────────
                 conn.execute(
                     "UPDATE accounts SET balance = balance - ? WHERE id = ? AND is_active = 1",
                     (tx.amount, tx.from_account),
                 )
-                conn.commit()
-                logger.debug(f"[Payment] Phase 1 complete: debited ${tx.amount:.2f} from {tx.from_account}")
+                debit_executed = True
+                logger.debug(
+                    f"[Payment] Phase 1 staged (not yet committed): "
+                    f"debit ${tx.amount:.2f} from {tx.from_account}"
+                )
 
-                # BUG: Intermittent failure between phase 1 and phase 2.
-                # Simulates: network timeout writing to replica, OOM on DB host,
-                # application crash (SIGKILL), etc.
-                if random.random() < settings.payment.partial_commit_rate:
-                    # Account debited, order NOT created → orphaned debit
-                    tx.mark_partial_commit(
-                        f"Phase 2 write failed after debit of ${tx.amount:.2f} "
-                        f"(intermittent DB error)"
+                # Simulate the intermittent failure that previously caused the
+                # orphaned debit.  With the fix in place, conn.rollback() will
+                # undo the staged debit so the account balance is not changed.
+                if inject_failure:
+                    raise PartialCommitError(
+                        f"Simulated intermittent DB error after debit stage "
+                        f"for tx={tx.id} (partial_commit_rate hit)"
                     )
-                    m.partial_commits_total.inc()
-                    m.orphaned_debits_total.inc()
-                    m.payment_transactions_total.labels(
-                        status="partial_commit",
-                        method=tx.method.value,
-                        currency=tx.currency,
-                    ).inc()
-                    m.app_errors_total.labels(
-                        component="payment_processor",
-                        error_type="partial_commit",
-                    ).inc()
-                    m.app_error_rate.set(1)
-                    logger.critical(
-                        f"[Payment] PARTIAL COMMIT: tx={tx.id} account={tx.from_account} "
-                        f"debited ${tx.amount:.2f} but order confirmation FAILED. "
-                        f"ORPHANED DEBIT created."
-                    )
-                    # Record to idempotency so we don't retry
-                    _idempotency_store[tx.idempotency_key] = tx
-                    m.idempotency_cache_size.set(len(_idempotency_store))
-                    return tx
 
-                # ── Phase 2: Confirm order ────────────────────────────────────
+                # ── Phase 2: Confirm order (same transaction) ─────────────────
                 order_id = str(uuid.uuid4())
                 merchant_id = f"merchant_{random.randint(100, 999)}"
 
@@ -279,7 +339,13 @@ class PaymentProcessor:
                         tx.created_at.isoformat(), datetime.utcnow().isoformat(),
                     ),
                 )
+
+                # ── Single atomic commit covering both phases ─────────────────
                 conn.commit()
+                logger.debug(
+                    f"[Payment] Atomic commit succeeded: debit + order confirmed "
+                    f"for tx={tx.id}"
+                )
 
                 tx.mark_completed()
                 reconciliation_service.record_transaction(tx)
@@ -298,7 +364,65 @@ class PaymentProcessor:
                     f"from={tx.from_account} to={tx.to_account}"
                 )
 
+            except PartialCommitError as e:
+                # ── Rollback the staged debit atomically ──────────────────────
+                # Because we have NOT committed, a rollback is sufficient to
+                # undo the Phase 1 debit with no orphaned state.
+                logger.warning(
+                    f"[Payment] Intermittent failure detected mid-transaction for "
+                    f"tx={tx.id}. Initiating rollback. error={e}"
+                )
+                if conn:
+                    try:
+                        conn.rollback()
+                        logger.info(
+                            f"[Payment] Rollback succeeded for tx={tx.id}: "
+                            f"debit of ${tx.amount:.2f} from account={tx.from_account} "
+                            f"was reversed. No orphaned debit."
+                        )
+                        # Debit was rolled back — no compensation needed.
+                        debit_executed = False
+                    except Exception as rb_exc:
+                        # Rollback itself failed (connection lost, etc.).
+                        # Fall through to the saga compensating credit below.
+                        logger.error(
+                            f"[Payment] Rollback FAILED for tx={tx.id}: {rb_exc}. "
+                            f"Will attempt saga compensating credit."
+                        )
+
+                # If rollback failed (debit_executed still True) issue saga credit.
+                await self._compensate_debit(tx, debit_confirmed=debit_executed)
+
+                tx.mark_failed(str(e))
+                m.payment_transactions_total.labels(
+                    status="failed_partial_commit_prevented",
+                    method=tx.method.value,
+                    currency=tx.currency,
+                ).inc()
+                m.app_errors_total.labels(
+                    component="payment_processor",
+                    error_type="partial_commit_prevented",
+                ).inc()
+                logger.info(
+                    f"[Payment] Partial commit PREVENTED for tx={tx.id}: "
+                    f"atomic rollback protected account={tx.from_account} "
+                    f"from orphaned debit of ${tx.amount:.2f}."
+                )
+                # Store in idempotency so callers get a consistent failed response.
+                _idempotency_store[tx.idempotency_key] = tx
+                m.idempotency_cache_size.set(len(_idempotency_store))
+                return tx
+
             except (DBConnectionError, PoolExhaustedError) as e:
+                # Attempt rollback; if it fails, saga compensation handles it.
+                if conn:
+                    try:
+                        conn.rollback()
+                        debit_executed = False
+                    except Exception:
+                        pass
+                await self._compensate_debit(tx, debit_confirmed=debit_executed)
+
                 tx.mark_failed(str(e))
                 m.payment_transactions_total.labels(
                     status="failed_db",
