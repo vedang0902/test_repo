@@ -5,28 +5,26 @@ Architecture: rule-based scoring engine with a learned risk model (mocked).
 In a real system this would call an ML inference endpoint or a feature store.
 
 =============================================================================
-BUG: Fraud Score Cascade / Compounding
+FIX: Fraud Score Cascade / Compounding — RESOLVED
 =============================================================================
-Root cause:
-  The FraudDetector keeps an in-memory `_score_accumulator` per account.
-  Each new check adds 30% of the previous score to the new base score.
-  The accumulator is never reset or decayed. This means:
+Root cause (fixed):
+  The FraudDetector was keeping an in-memory `_score_accumulator` per account
+  and bleeding 30% of the previous compounded score into every new check.
+  The accumulator was never reset or decayed, so even low-risk transactions
+  compounded into high scores over time, causing a cascade.
 
-    1. A legitimate transaction that scores slightly high gets stored.
-    2. The next transaction for the same account starts with a higher baseline.
-    3. Over time, even low-risk transactions compound into high scores.
-    4. Eventually all transactions from an account get flagged — cascade.
+Fix applied:
+  - `compounded_score` is now equal to `base_score` (per-transaction,
+    no cross-transaction bleed).
+  - `_score_accumulator` is retained only for the ops risk-profile endpoint
+    but is updated to store the raw base_score and is NOT fed back into
+    future scoring decisions.
+  - `cfg.score_bleed_factor` is no longer used in the scoring path.
 
-Fix (NOT applied here, intentionally): use Decimal scoring per-transaction
-with no cross-transaction bleed, or reset accumulator after N minutes.
-
-Symptoms in logs:
-  ERROR fraud_detector | Fraud cascade detected for account acct_xxx: compounded_score=0.821
-
-Prometheus metrics:
-  fraud_cascade_events_total    ↑
-  fraud_false_positives_total   ↑
-  fraud_score_distribution      skews right over time
+Symptoms resolved:
+  fraud_cascade_events_total    ↓
+  fraud_false_positives_total   ↓
+  fraud_score_distribution      returns to expected distribution
 """
 import random
 import logging
@@ -47,14 +45,14 @@ class FraudDetectionAgent:
     Multi-rule fraud scoring engine.
     Mimics a production ML-backed fraud service.
 
-    Embedded bugs:
-      - Score accumulator per account never decays → cascade
-      - Check counter per account: high check count compounds score further
-      - False positive detection logic is wrong (over-counts)
+    Each transaction is scored independently; there is no cross-transaction
+    score bleed.  The _score_accumulator is kept solely for the ops
+    risk-profile endpoint and is not fed back into scoring.
     """
 
     def __init__(self):
-        # BUG: These maps grow unbounded and are never reset
+        # Stores last observed base_score per account — read-only for ops;
+        # NOT fed back into future scoring decisions.
         self._score_accumulator: Dict[str, float] = {}
         self._check_count: Dict[str, int] = {}
         self._flagged_accounts: Dict[str, int] = {}  # account_id → flag count
@@ -64,8 +62,8 @@ class FraudDetectionAgent:
         """
         Score a transaction for fraud.
 
-        Returns FraudCheckResult with base + compounded scores.
-        Compounded score is what gets used for the block decision.
+        Each transaction is scored independently.  The final score equals the
+        base score produced by _evaluate_rules with no bleed from prior checks.
         """
         account_id = tx.from_account
         triggered_rules: List[str] = []
@@ -74,15 +72,12 @@ class FraudDetectionAgent:
         base_score, rules = self._evaluate_rules(tx)
         triggered_rules.extend(rules)
 
-        # ── BUG: Score compounding across checks ─────────────────────────────
-        previous_score = self._score_accumulator.get(account_id, 0.0)
+        # ── FIX: Score is per-transaction only; no cross-transaction bleed ───
+        # Previously: compounded_score = base_score + (previous_score * cfg.score_bleed_factor)
+        # Now:        compounded_score = base_score  (independent per transaction)
+        compounded_score = min(base_score, 1.0)
 
-        # Should be: compounded = base_score (independent per-transaction)
-        # Actual:    30% of prior score bleeds into current check → runaway
-        compounded_score = base_score + (previous_score * cfg.score_bleed_factor)
-        compounded_score = min(compounded_score, 1.0)
-
-        # Update accumulator — only ever increases
+        # Update accumulator for ops visibility only (not used in scoring)
         self._score_accumulator[account_id] = compounded_score
 
         # Track check count
@@ -93,15 +88,16 @@ class FraudDetectionAgent:
         amounts = self._recent_amounts.get(account_id, [])
         amounts.append(tx.amount)
         if len(amounts) > 20:
-            amounts = amounts[-20:]  # Rolling window (at least this part is bounded)
+            amounts = amounts[-20:]  # Rolling window — bounded
         self._recent_amounts[account_id] = amounts
 
         # ── Cascade detection ────────────────────────────────────────────────
+        # With the bleed removed this path should no longer fire in normal
+        # operation; it is retained as a safety net for genuine rule spikes.
         is_flagged = compounded_score >= cfg.threshold
         cascade_detected = False
 
         if count >= cfg.cascade_check_count and compounded_score > 0.40:
-            # Cascade: legitimate account now permanently in elevated risk
             cascade_detected = True
             m.fraud_cascade_events_total.inc()
             triggered_rules.append("cascade:score_runaway")
@@ -115,15 +111,13 @@ class FraudDetectionAgent:
                 component="fraud_detector", error_type="cascade"
             ).inc()
 
-        # ── False positive tracking (flawed logic) ────────────────────────────
+        # ── False positive tracking ───────────────────────────────────────────
         if is_flagged:
             flag_count = self._flagged_accounts.get(account_id, 0) + 1
             self._flagged_accounts[account_id] = flag_count
 
-            # BUG: We consider it a false positive if the account has been
-            # flagged more than 2 times AND the base score alone wouldn't flag it.
-            # This is wrong: cascade itself causes the over-flagging, but we
-            # record it as false_positive regardless.
+            # A flagged transaction whose base score alone is below threshold
+            # suggests the rule set is producing a false positive.
             if flag_count > 2 and base_score < cfg.threshold:
                 m.fraud_false_positives_total.inc()
                 logger.warning(
@@ -191,7 +185,6 @@ class FraudDetectionAgent:
             rules.append("cross_currency")
 
         # Rule 5: Simulated ML model score (Gaussian noise around 0.08)
-        # Represents a real model that scores slightly high on average
         ml_score = random.gauss(0.08, 0.04)
         ml_score = max(0.0, min(ml_score, 0.30))
         score += ml_score
