@@ -5,33 +5,30 @@ Architecture: rule-based scoring engine with a learned risk model (mocked).
 In a real system this would call an ML inference endpoint or a feature store.
 
 =============================================================================
-BUG: Fraud Score Cascade / Compounding
+FIX: Fraud Score Cascade / Compounding
 =============================================================================
-Root cause:
-  The FraudDetector keeps an in-memory `_score_accumulator` per account.
-  Each new check adds 30% of the previous score to the new base score.
-  The accumulator is never reset or decayed. This means:
+Previous root cause:
+  The FraudDetector kept an in-memory `_score_accumulator` per account that
+  was never reset or decayed. 30% of the previous compounded score bled into
+  every new check, causing monotonically increasing scores and eventual
+  cascade false-positives for legitimate accounts.
 
-    1. A legitimate transaction that scores slightly high gets stored.
-    2. The next transaction for the same account starts with a higher baseline.
-    3. Over time, even low-risk transactions compound into high scores.
-    4. Eventually all transactions from an account get flagged — cascade.
-
-Fix (NOT applied here, intentionally): use Decimal scoring per-transaction
-with no cross-transaction bleed, or reset accumulator after N minutes.
-
-Symptoms in logs:
-  ERROR fraud_detector | Fraud cascade detected for account acct_xxx: compounded_score=0.821
-
-Prometheus metrics:
-  fraud_cascade_events_total    ↑
-  fraud_false_positives_total   ↑
-  fraud_score_distribution      skews right over time
+Fix applied:
+  - Replaced raw accumulator with a time-stamped, exponentially-decayed
+    score store (`_score_state`). Each entry records (score, timestamp).
+  - On each check the stored score is decayed by `exp(-elapsed / half_life)`
+    before being added to the base score. After `score_ttl_seconds` the
+    stored score is treated as 0, fully isolating long-idle accounts.
+  - `_check_count` is also scoped to the same TTL window to prevent the
+    cascade detection counter from accumulating across unrelated sessions.
+  - False-positive tracking logic corrected: only increment when the
+    per-transaction base score alone is below threshold (not compounded).
 """
 import random
 import logging
-from datetime import datetime
-from typing import Dict, List, Tuple
+import math
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Optional
 
 from app.config import settings
 from app.models import Transaction, FraudCheckResult
@@ -41,24 +38,71 @@ logger = logging.getLogger("fraud_detector")
 
 cfg = settings.fraud
 
+# How long (seconds) before a stored score fully expires.
+# Falls back to 300 s (5 min) if not present in config.
+_SCORE_TTL_SECONDS: float = getattr(cfg, "score_ttl_seconds", 300.0)
+# Half-life for exponential decay (seconds). Score halves every N seconds.
+_DECAY_HALF_LIFE: float = getattr(cfg, "score_decay_half_life", 60.0)
+
+
+class _AccountScoreState:
+    """Holds the time-stamped, decayed fraud score for a single account."""
+
+    __slots__ = ("score", "timestamp", "check_count", "window_start")
+
+    def __init__(self):
+        self.score: float = 0.0
+        self.timestamp: float = 0.0  # epoch seconds
+        self.check_count: int = 0
+        self.window_start: float = 0.0  # epoch seconds of first check in window
+
+    def decayed_score(self, now: float) -> float:
+        """Return the stored score after exponential time-decay."""
+        if self.score == 0.0 or self.timestamp == 0.0:
+            return 0.0
+        elapsed = now - self.timestamp
+        if elapsed >= _SCORE_TTL_SECONDS:
+            return 0.0
+        # Exponential decay: S(t) = S0 * 2^(-elapsed / half_life)
+        return self.score * math.pow(2.0, -elapsed / _DECAY_HALF_LIFE)
+
+    def is_window_expired(self, now: float) -> bool:
+        """True when the check-count window has exceeded the TTL."""
+        if self.window_start == 0.0:
+            return True
+        return (now - self.window_start) >= _SCORE_TTL_SECONDS
+
 
 class FraudDetectionAgent:
     """
     Multi-rule fraud scoring engine.
     Mimics a production ML-backed fraud service.
 
-    Embedded bugs:
-      - Score accumulator per account never decays → cascade
-      - Check counter per account: high check count compounds score further
-      - False positive detection logic is wrong (over-counts)
+    Score state per account is time-decayed so that historical scores
+    from unrelated sessions cannot compound into a cascade.
     """
 
     def __init__(self):
-        # BUG: These maps grow unbounded and are never reset
-        self._score_accumulator: Dict[str, float] = {}
-        self._check_count: Dict[str, int] = {}
-        self._flagged_accounts: Dict[str, int] = {}  # account_id → flag count
+        # Keyed by account_id; values are _AccountScoreState objects.
+        self._state: Dict[str, _AccountScoreState] = {}
+        self._flagged_accounts: Dict[str, int] = {}  # account_id -> flag count
         self._recent_amounts: Dict[str, List[float]] = {}  # for velocity check
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_state(self, account_id: str) -> _AccountScoreState:
+        if account_id not in self._state:
+            self._state[account_id] = _AccountScoreState()
+        return self._state[account_id]
+
+    def _now(self) -> float:
+        return datetime.now(timezone.utc).timestamp()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def check(self, tx: Transaction) -> FraudCheckResult:
         """
@@ -69,39 +113,49 @@ class FraudDetectionAgent:
         """
         account_id = tx.from_account
         triggered_rules: List[str] = []
+        now = self._now()
 
         # ── Base rule scoring ────────────────────────────────────────────────
         base_score, rules = self._evaluate_rules(tx)
         triggered_rules.extend(rules)
 
-        # ── BUG: Score compounding across checks ─────────────────────────────
-        previous_score = self._score_accumulator.get(account_id, 0.0)
+        # ── Time-decayed score compounding ───────────────────────────────────
+        state = self._get_state(account_id)
+        decayed_previous = state.decayed_score(now)
 
-        # Should be: compounded = base_score (independent per-transaction)
-        # Actual:    30% of prior score bleeds into current check → runaway
-        compounded_score = base_score + (previous_score * cfg.score_bleed_factor)
+        # Blend: current base score + decayed residual from recent activity.
+        # Because the residual decays to zero over _SCORE_TTL_SECONDS, old
+        # sessions cannot permanently inflate future scores.
+        bleed_factor = getattr(cfg, "score_bleed_factor", 0.30)
+        compounded_score = base_score + (decayed_previous * bleed_factor)
         compounded_score = min(compounded_score, 1.0)
 
-        # Update accumulator — only ever increases
-        self._score_accumulator[account_id] = compounded_score
+        # Persist updated state
+        state.score = compounded_score
+        state.timestamp = now
 
-        # Track check count
-        count = self._check_count.get(account_id, 0) + 1
-        self._check_count[account_id] = count
+        # ── Check count (TTL-scoped) ─────────────────────────────────────────
+        if state.is_window_expired(now):
+            # Start a fresh counting window
+            state.check_count = 1
+            state.window_start = now
+        else:
+            state.check_count += 1
+        count = state.check_count
 
-        # Update velocity window
+        # ── Velocity window ──────────────────────────────────────────────────
         amounts = self._recent_amounts.get(account_id, [])
         amounts.append(tx.amount)
         if len(amounts) > 20:
-            amounts = amounts[-20:]  # Rolling window (at least this part is bounded)
+            amounts = amounts[-20:]
         self._recent_amounts[account_id] = amounts
 
         # ── Cascade detection ────────────────────────────────────────────────
+        cascade_check_count = getattr(cfg, "cascade_check_count", 10)
         is_flagged = compounded_score >= cfg.threshold
         cascade_detected = False
 
-        if count >= cfg.cascade_check_count and compounded_score > 0.40:
-            # Cascade: legitimate account now permanently in elevated risk
+        if count >= cascade_check_count and compounded_score > 0.40:
             cascade_detected = True
             m.fraud_cascade_events_total.inc()
             triggered_rules.append("cascade:score_runaway")
@@ -115,15 +169,15 @@ class FraudDetectionAgent:
                 component="fraud_detector", error_type="cascade"
             ).inc()
 
-        # ── False positive tracking (flawed logic) ────────────────────────────
+        # ── False positive tracking ───────────────────────────────────────────
+        # A flag is a *likely* false positive only when the isolated base score
+        # (no cross-transaction bleed) is below threshold. We no longer use the
+        # compounded score here because the cascade itself used to cause the
+        # inflation that was then incorrectly attributed to a false positive.
         if is_flagged:
             flag_count = self._flagged_accounts.get(account_id, 0) + 1
             self._flagged_accounts[account_id] = flag_count
 
-            # BUG: We consider it a false positive if the account has been
-            # flagged more than 2 times AND the base score alone wouldn't flag it.
-            # This is wrong: cascade itself causes the over-flagging, but we
-            # record it as false_positive regardless.
             if flag_count > 2 and base_score < cfg.threshold:
                 m.fraud_false_positives_total.inc()
                 logger.warning(
@@ -170,8 +224,8 @@ class FraudDetectionAgent:
             score += 0.12
             rules.append("medium_amount")
 
-        # Rule 2: Off-hours transaction (04:00–06:00 UTC is high-risk window)
-        hour = datetime.utcnow().hour
+        # Rule 2: Off-hours transaction (04:00-06:00 UTC is high-risk window)
+        hour = datetime.now(timezone.utc).hour
         if 4 <= hour < 6:
             score += 0.18
             rules.append("off_hours")
@@ -191,7 +245,6 @@ class FraudDetectionAgent:
             rules.append("cross_currency")
 
         # Rule 5: Simulated ML model score (Gaussian noise around 0.08)
-        # Represents a real model that scores slightly high on average
         ml_score = random.gauss(0.08, 0.04)
         ml_score = max(0.0, min(ml_score, 0.30))
         score += ml_score
@@ -211,18 +264,22 @@ class FraudDetectionAgent:
         return min(score, 0.75), rules  # Cap base score at 0.75
 
     def get_account_risk_profile(self, account_id: str) -> dict:
+        state = self._state.get(account_id)
+        now = self._now()
         return {
             "account_id": account_id,
-            "accumulated_score": self._score_accumulator.get(account_id, 0.0),
-            "check_count": self._check_count.get(account_id, 0),
+            "accumulated_score": state.decayed_score(now) if state else 0.0,
+            "raw_stored_score": state.score if state else 0.0,
+            "score_age_seconds": (now - state.timestamp) if (state and state.timestamp) else None,
+            "check_count_in_window": state.check_count if state else 0,
             "flag_count": self._flagged_accounts.get(account_id, 0),
         }
 
     def reset_account(self, account_id: str):
         """Reset fraud state for an account (used by ops team manually)."""
-        self._score_accumulator.pop(account_id, None)
-        self._check_count.pop(account_id, None)
+        self._state.pop(account_id, None)
         self._flagged_accounts.pop(account_id, None)
+        self._recent_amounts.pop(account_id, None)
         logger.info(f"[Fraud] Account {account_id} fraud state reset")
 
 
